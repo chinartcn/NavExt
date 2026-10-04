@@ -1,0 +1,51 @@
+{
+  "site": {
+    "title": "html中心",
+    "description": "所有页面的统一入口",
+    "logo": "😂",
+    "footer": "© 2026 rtcn",
+    "accent": "#4f6ef7",
+    "showStats": true
+  },
+  "ignoreDirs": [
+    "node_modules",
+    ".git"
+  ],
+  "ignoreFiles": [
+    "*.tmp.html",
+    "draft-*.html"
+  ],
+  "home": {
+    "enabled": false,
+    "applyExtensions": true,
+    "file": "home.html",
+    "routes": [
+      {
+        "match": {
+          "path": "/docs"
+        },
+        "file": "docs.html"
+      },
+      {
+        "match": {
+          "path": "/blog"
+        },
+        "file": "blog.html",
+        "applyExtensions": false
+      }
+    ]
+  },
+  "htmlExtensions": [
+    ".html",
+    ".htm"
+  ],
+  "port": 3000,
+  "host": "0.0.0.0",
+  "depth": 8,
+  "cache": {
+    "html": true,
+    "extTtl": 1000,
+    "scanTtl": 400,
+    "cfgTtl": 1000
+  }
+}
