@@ -59,8 +59,9 @@ NavExt.on('view-changed', decorate);     // 视图切换后
 顺带演示了**配置 schema**（`js.json` 的 `config`）—— 用户可在
 扩展管理面板里改标题颜色和体积上限。
 
-> 注意：`ctx.fs` 只能读**扩展自己的目录**。要读站点文件必须用原生 `fs`
-> —— 这正印证了「扩展 = 完全信任」那条文档。
+> 读站点文件用 `ctx.project`（v2.8.0 新增）：只读、限定在站点 `root` 内，
+> 越界 / 隐藏路径 / 软链接三重校验由内核完成，扩展不必自己拼 `path.resolve`。
+> 本示例已从原生 `fs` 迁移到 `ctx.project`。
 
 ### ex4-reading-stats — 阅读时长与热度
 

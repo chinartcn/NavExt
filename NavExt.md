@@ -89,6 +89,7 @@
 | 🎯 **扩展作用域** | `js.list.json` 按路径精细控制扩展生效范围 |
 | ♻️ **扩展生命周期** | `onDispose`（服务端）+ `NavExt.disposer`（客户端），禁用/卸载自动清理 |
 | 🧭 **路径归一化** | `urlToRel` / `relToUrl` / `pathOf`，统一 URL 与相对两套路径体系 |
+| 📁 **站点只读 API** | `ctx.project.read/list/stat/exists`，扩展读站点文件不必再用原生 `fs` |
 
 ## 快速开始
 
@@ -239,6 +240,9 @@ dist/
 | `enabled` | boolean | `true` | 是否启用扩展系统 |
 | `dir` | string | `".js"` | 扩展目录名（相对 `root`） |
 | `configFile` | string | `"config.json"` | 用户配置文件，存在 `.js/` 下 |
+| `timeout` | number | `5000` | 异步钩子（`onHtml`/`onRequest`）超时 ms，`0` 禁用 |
+| `fetchTimeout` | number | `30000` | `ctx.fetch` 默认超时 ms |
+| `projectMaxBytes` | number | `4194304` | `ctx.project.read` 单文件上限（字节），v2.8 |
 
 #### api 服务端 API
 
@@ -759,6 +763,50 @@ dir 扩展根目录绝对路径
 > 它只防止"手滑写错路径"，**不能**阻止扩展直接用原生 `fs` 读写任意文件。
 > 扩展装入 `.js/` 后即以服务器进程权限运行 —— **安装第三方扩展 = 完全信任其作者**，
 > 与安装 npm 包同级。装前请务必用 `vm.js` 审计（见下节）。
+
+### 扩展端 ctx.project（v2.8）
+
+`ctx.fs` 锁在扩展自己的目录里，读不到站点文件。要在扩展里读站点的 `.md` / `.html` / 配置，
+以前只能 `require('fs')` —— 绕开了所有校验。`ctx.project` 提供一个**受限的只读**入口：
+
+```js
+module.exports = {
+  onRequest(req, url, ctx) {
+    if (!/\.md$/i.test(url.pathname)) return undefined;
+
+    // URL 路径 → 站点相对路径（v2.7 归一化工具）
+    var rel = ctx.urlToRel(url.pathname);
+
+    // 不存在就交回内核（会 404），不必自己判断
+    var st = ctx.project.stat(rel);
+    if (!st || st.type !== 'file') return undefined;
+
+    var md = ctx.project.read(rel, { maxBytes: 256 * 1024 });
+    return { status: 200, type: 'text/html; charset=utf-8', body: render(md) };
+  },
+};
+```
+
+| 方法 | 说明 |
+| --- | --- |
+| `read(rel, opts?)` | 读文件。`opts` 可为编码字符串，或 `{ encoding, maxBytes }`；`encoding: 'buffer'` 返回 Buffer |
+| `exists(rel)` | 存在性（被拒绝的路径一律返回 `false`） |
+| `stat(rel)` | 返回 `{ path, type, size, mtimeMs }`；**不存在返回 `null`**（不抛错，方便探测） |
+| `list(rel, opts?)` | 列目录，返回 `[{ name, path, type }]`；`opts.depth` 控制递归层数（默认 1） |
+| `path(rel)` | 解析为绝对路径（给需要传路径的第三方库） |
+| `root` | 站点根目录绝对路径 |
+
+**三重校验，与静态资源服务同源**：
+
+1. **越界**：`../`、绝对路径、Windows 盘符、`\0` 一律拒绝；
+2. **隐藏路径**：路径中任一段以 `.` 开头即拒绝 —— `.js/`（其他扩展的代码）、`.git/`、`.navext.client.js` 都读不到；
+3. **软链接**：指向 root 之外的符号链接被拦下（`path 越界（符号链接指向外部）`）。
+
+> 因此**"扩展能读到的文件" = "静态服务器愿意暴露的文件"**，多了这个 API 不扩大攻击面。
+> 只读：没有 `write` / `delete`。
+
+默认单文件上限 4 MB，可用 `server.json` 的 `extensions.projectMaxBytes` 调整。
+超限抛出的错误带 `code: 'PROJECT_FS_TOO_LARGE'`。
 
 ### 扩展安全审计 — vm.js
 
@@ -2856,6 +2904,7 @@ v2.5 第一档能力 onResponse 响应钩子（可改状态/头/体）+ GET /api
 v2.6 内置 UI + 安全审计 视图切换（按目录/按时间）+ 主题切换与自定义主题色 + html.json 隐藏条目（含 glob）+ vm.js 扩展安全沙箱检测器
 v2.7.0 扩展生命周期 + 路径归一化 服务端 onDispose 钩子；客户端 NavExt.disposer / dispose / isDisposed + pagehide/beforeunload 自动清理 + pageshow(bfcache) 重派 init；urlToRel / relToUrl / pathOf / normalizePath 双端一致（统一 URL 与相对两套路径体系）；5 个教学示例
 v2.7.1 文档拆分 NavExt.md 保留全文并加索引；新增 MD/ 目录：10 篇主题文档 + 导航首页 +《从零写第一个扩展》手把手教程
+v2.8.0 ctx.project 扩展可只读访问站点文件（read/list/stat/exists，三重校验：越界 + 隐藏路径 + 软链接）；修复 urlToRel / relToUrl 只认 .html 扩展名导致 .md/.json/.css 等被误当目录（双实现同步修复）
 
 ---
 

@@ -101,7 +101,7 @@ const path = require('path');
 const vm = require('vm');
 
 /** 服务端版本 —— 会通过 __NAV_DATA__ 传给客户端 */
-const SERVER_VERSION = '2.7.1';
+const SERVER_VERSION = '2.8.0';
 
 /** 客户端库路径 —— 与 server.js 同目录，文件名以 . 开头，静态路由自动拒绝 */
 const NAVEXT_CLIENT_PATH = path.join(__dirname, '.navext.client.js');
@@ -1361,6 +1361,21 @@ function hasHtmlExt(p) {
 }
 
 /**
+ * 末段是否带文件扩展名（用于区分「文件」与「目录」）
+ *   'a.md'        → true
+ *   'a/b.json'    → true
+ *   '.hidden'     → false   （纯隐藏文件，不算扩展名）
+ *   'a.b/c'       → false   （扩展名必须在最后一段）
+ *   'docs'        → false
+ */
+function hasFileExt(p) {
+  const s = String(p == null ? '' : p);
+  const last = s.slice(s.lastIndexOf('/') + 1);
+  if (!last || last.startsWith('.')) return false;
+  return /\.[a-zA-Z0-9]+$/.test(last);
+}
+
+/**
  * 去查询串/哈希，decode，压缩重复斜杠，去掉所有 './' 段。
  * 不做大小写转换（大小写敏感文件系统上不能丢信息）。
  */
@@ -1384,6 +1399,7 @@ function cleanPathInput(p) {
  *   '/docs/'       → 'docs/index.html'
  *   '/'            → 'index.html'
  *   'docs/a.html'  → 'docs/a.html'   （已是相对路径则原样规范）
+ *   '/docs/a.md'   → 'docs/a.md'     （任意扩展名的文件都原样保留）
  *   'index.html'   → 'index.html'
  *
  * @param {string} p
@@ -1397,8 +1413,9 @@ function urlToRel(p, indexName) {
 
   if (s === '') return isUrl ? idx : '';
   if (s.endsWith('/')) return s + idx;
-  if (hasHtmlExt(s)) return s;
-  // 无后缀：请求侧是"目录/站点别名"，文件侧补默认文档名
+  // 只要末段带扩展名，就是文件（.html / .md / .json / .css … 一视同仁）
+  if (hasFileExt(s)) return s;
+  // 无扩展名：请求侧是"目录/站点别名"，文件侧补默认文档名
   if (isUrl) return s + '/' + idx;
   return s;
 }
@@ -1757,6 +1774,136 @@ function saveUserConfig(cfg, data) {
   writeJson(p, data);
 }
 
+/**
+ * 为扩展构造 ctx.project（只读、限定在站点根目录内）
+ *
+ * 与 ctx.fs 的分工：
+ *   ctx.fs      —— 扩展自己的目录，可读可写
+ *   ctx.project —— 站点项目目录，只读
+ *
+ * 校验规则与静态资源服务（resolveStaticPath）保持一致：
+ *   1. 不得越出 root；
+ *   2. 路径中任一段以 '.' 开头即拒绝（.js/ / .git/ / .navext.client.js 等）；
+ *   3. 软链接不得逃逸 root（由 fsResolveUnder 的真实路径校验兜底）。
+ *
+ * 这样"扩展能读到的文件"恰好等于"静态服务器愿意暴露的文件"，
+ * 不会因为多了个 API 而扩大攻击面。
+ */
+function makeProjectFs(root, defaultMaxBytes) {
+  const MAX = defaultMaxBytes || 4 * 1024 * 1024;
+
+  /** 解析并校验；失败返回 { error }，成功返回 { full, rel } */
+  function resolve(rel) {
+    const r = fsResolveUnder(root, rel || '');
+    if (r.error) return r;
+    // 与静态资源同一套规则：任何以 '.' 开头的路径段都不可见
+    if (r.rel) {
+      const segs = r.rel.split('/');
+      for (const seg of segs) {
+        if (seg.startsWith('.')) return { error: 'path 不可见（隐藏路径）' };
+      }
+    }
+    return r;
+  }
+
+  return {
+    root,
+
+    /** 解析为绝对路径（主要给需要传给第三方库的场景） */
+    path(rel) {
+      const r = resolve(rel);
+      if (r.error) throw new Error(r.error);
+      return r.full;
+    },
+
+    exists(rel) {
+      const r = resolve(rel);
+      if (r.error) return false;
+      try { fs.accessSync(r.full); return true; }
+      catch { return false; }
+    },
+
+    /**
+     * 读文件。默认 utf8，可传 'buffer' 拿 Buffer。
+     * @param {string} rel
+     * @param {string|{encoding?:string, maxBytes?:number}} [opts]
+     */
+    read(rel, opts) {
+      let encoding = 'utf8';
+      let maxBytes = MAX;
+      if (typeof opts === 'string') encoding = opts;
+      else if (opts && typeof opts === 'object') {
+        if (opts.encoding) encoding = opts.encoding;
+        if (Number.isFinite(opts.maxBytes)) maxBytes = opts.maxBytes;
+      }
+
+      const r = resolve(rel);
+      if (r.error) throw new Error(r.error);
+
+      let st;
+      try { st = fs.statSync(r.full); }
+      catch (e) { throw new Error(`读不到 ${r.rel || '.'}：${e.code || e.message}`); }
+      if (st.isDirectory()) throw new Error(`${r.rel || '.'} 是目录，不是文件`);
+      if (st.size > maxBytes) {
+        throw Object.assign(
+          new Error(`文件 ${r.rel} 有 ${st.size} 字节，超过上限 ${maxBytes}`),
+          { code: 'PROJECT_FS_TOO_LARGE' }
+        );
+      }
+
+      // 'buffer' 是给 Buffer 的快捷写法，不是真实编码名
+      if (encoding === 'buffer') return fs.readFileSync(r.full);
+      return fs.readFileSync(r.full, encoding);
+    },
+
+    /** 列目录（默认不递归，depth=1） */
+    list(rel, opts) {
+      const depth = (opts && Number.isFinite(opts.depth)) ? opts.depth : 1;
+      const r = resolve(rel);
+      if (r.error) throw new Error(r.error);
+
+      try {
+        const st = fs.statSync(r.full);
+        if (!st.isDirectory()) throw new Error(`${r.rel || '.'} 不是目录`);
+      } catch (e) {
+        if (e.code === 'ENOENT') throw new Error(`目录不存在：${r.rel || '.'}`);
+        throw e;
+      }
+
+      const out = [];
+      const walk = (dirFull, dirRel, level) => {
+        let entries;
+        try { entries = fs.readdirSync(dirFull, { withFileTypes: true }); }
+        catch { return; }
+        for (const e of entries) {
+          if (e.name.startsWith('.')) continue;          // 隐藏项一律不列
+          const childRel = dirRel ? `${dirRel}/${e.name}` : e.name;
+          const isDir = e.isDirectory();
+          out.push({ name: e.name, path: childRel, type: isDir ? 'dir' : 'file' });
+          if (isDir && level < depth) walk(path.join(dirFull, e.name), childRel, level + 1);
+        }
+      };
+      walk(r.full, r.rel, 1);
+      return out;
+    },
+
+    /** 文件信息；不存在返回 null（不抛错，方便用作探测） */
+    stat(rel) {
+      const r = resolve(rel);
+      if (r.error) throw new Error(r.error);
+      let st;
+      try { st = fs.statSync(r.full); }
+      catch { return null; }
+      return {
+        path: r.rel,
+        type: fsGetType(st),
+        size: st.size,
+        mtimeMs: st.mtimeMs,
+      };
+    },
+  };
+}
+
 /** 为扩展构造 ctx.fs（同步、限定在扩展目录内） */
 /** 扩展生命周期资源注册表：扩展重载时统一清理 */
 function ensureExtDisposables(ext) {
@@ -1956,6 +2103,11 @@ function makeExtCtx(app, ext, base, req) {
     hasUserConfig: ext.config.hasUserValues,
     scope: ext.scope,
     fs: makeExtFs(ext.dir),
+    // ── 站点项目只读（v2.8）：读站点文件不必再 require('fs') ──
+    project: makeProjectFs(
+      app.cfg ? app.cfg.root : '',
+      (app.cfg && app.cfg.extensions && app.cfg.extensions.projectMaxBytes) || undefined
+    ),
     // ── 网络请求（带超时 + 扩展重载时自动 abort） ──
     fetch: (url, opts) => _ctxFetch(app, ext, url, opts),
 

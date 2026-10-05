@@ -30,6 +30,14 @@
 
   function hasHtmlExt(p) { return /\.html?$/i.test(String(p)); }
 
+  /* 末段是否带文件扩展名（区分「文件」与「目录」） */
+  function hasFileExt(p) {
+    var s = String(p == null ? '' : p);
+    var last = s.slice(s.lastIndexOf('/') + 1);
+    if (!last || last.charAt(0) === '.') return false;
+    return /\.[a-zA-Z0-9]+$/.test(last);
+  }
+
   function cleanPathInput(p) {
     var s = String(p == null ? '' : p);
     var hash = s.indexOf('#');
@@ -50,7 +58,8 @@
     s = s.replace(/^\/+/, '');
     if (s === '') return isUrl ? idx : '';
     if (s.charAt(s.length - 1) === '/') return s + idx;
-    if (hasHtmlExt(s)) return s;
+    // 只要末段带扩展名就是文件（.html / .md / .json / .css … 一视同仁）
+    if (hasFileExt(s)) return s;
     return isUrl ? (s + '/' + idx) : s;
   }
 
