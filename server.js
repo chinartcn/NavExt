@@ -131,10 +131,24 @@ const DEFAULT_CONFIG = Object.freeze({
 
   api: Object.freeze({
     enabled: true,
+    // v2.8.1：写文件接口（/api/extensions/:id/fs/*）默认关闭。
+    //
+    // 原因：这些端点无鉴权，且写入的内容位于扩展目录内——扩展文件会被热重载
+    // 并作为 CommonJS 模块执行。也就是说「一个 HTTP POST → 写 index.js →
+    // 热重载 → 执行任意代码」是一条完整链路，默认开启等于默认开放远程代码执行。
+    //
+    // 这里只关 fs.write、不关 writable，是为了让两个无代码执行风险的功能
+    // 保持默认可用：浏览器里改扩展配置、运行时 toggle 扩展启停。
+    // 这两者写的都是纯数据（受 schema 约束的 config.json、mod.json 的
+    // enabled 布尔），无法注入可执行代码。
+    //
+    // 需要文件写入（如带状态的扩展要落盘）时，在 server.json 显式打开：
+    //   { "api": { "fs": { "write": true } } }
+    // 完全只读部署再把 writable 也关掉。
     writable: true,
     fs: Object.freeze({
       read: true,
-      write: true,
+      write: false,
       maxReadSize: 10 * 1024 * 1024,
       maxWriteSize: 1 * 1024 * 1024,
       maxListEntries: 2000,
@@ -3303,6 +3317,10 @@ function handleSearch(app, res, url) {
   const q = (url.searchParams.get('q') || '').trim();
   const limitRaw = toInt(url.searchParams.get('limit'), 50);
   const limit = Math.min(Math.max(limitRaw || 50, 1), 500);
+  // v2.8.1：新增 offset 分页。此前 limit 硬钳在 500 且无分页参数，
+  // 宽泛查询命中上千条时只能拿到前 500 条，剩下的是静默丢失。
+  const offsetRaw = toInt(url.searchParams.get('offset'), 0);
+  const offset = Math.max(offsetRaw || 0, 0);
   const dirFilter = (url.searchParams.get('dir') || '').trim().replace(/^\/+|\/+$/g, '');
 
   if (!q) {
@@ -3352,7 +3370,7 @@ function handleSearch(app, res, url) {
   scored.sort((a, b) => (b.score - a.score) || a.f.rel.localeCompare(b.f.rel, 'zh-Hans-CN', { numeric: true }));
 
   const total = scored.length;
-  const items = scored.slice(0, limit).map(({ f, score }) => ({
+  const items = scored.slice(offset, offset + limit).map(({ f, score }) => ({
     rel: f.rel,
     name: f.name,
     dir: f.dir,
@@ -3368,6 +3386,9 @@ function handleSearch(app, res, url) {
     total,
     count: items.length,
     limit,
+    offset,
+    // 还有下一页可取（v2.8.1 新增：offset + count < total）
+    hasMore: offset + items.length < total,
     truncated: total > items.length,
     items,
   });
@@ -3392,7 +3413,11 @@ function apiExtensionsList(app, cfg) {
 }
 
 function apiConfigPayload(app, cfg) {
-  const { files, dirMeta } = getState(app, true);
+  // v2.8.1：去掉 force。原先传 true 会绕过扫描缓存，导致每个请求都全量重扫
+  // 目录（2000 文件时单次 ~330ms，20 并发直接堆到 8.5s）。
+  // 这里只需要 fileCount 和目录元数据，用缓存态即可；
+  // 确实需要强制重扫的调用方走 ?fresh=1 / ?refresh=1（getState 已有该通路）。
+  const { files, dirMeta } = getState(app);
   return {
     root: cfg.root,
     configPath: app.cfgFound ? app.configPath : null,
@@ -4396,6 +4421,11 @@ function printBanner(app, cfg) {
   console.log(`  文件系统 ${cfg.api.enabled
     ? `读:${cfg.api.fs.read ? '开' : '关'} 写:${cfg.api.fs.write ? '开' : '关'}`
     : '已禁用'}`);
+  // v2.8.1：写文件默认关闭时明确提示原因与开启方式，避免用户以为接口坏了
+  if (cfg.api.enabled && cfg.api.writable && !cfg.api.fs.write) {
+    console.log('           ↑ 扩展文件写入已关闭（写入内容会被热重载执行，默认不开放）');
+    console.log('             需要时在 server.json 打开：{ "api": { "fs": { "write": true } } }');
+  }
   const cacheLine = cfg.cache.html
     ? `开 (扩展 TTL ${cfg.cache.extTtl || TTL.ext}ms)`
     : "关";
@@ -4425,8 +4455,9 @@ function printBanner(app, cfg) {
   console.log(`  导航页   http://${shown}:${cfg.port}/`);
   console.log(`  JSON     http://${shown}:${cfg.port}/?format=json`);
   console.log('  ────────────────────────────────────────');
-  console.log('  ♻  热重载：server.json / html.json / .js / .navext.client.js 改完刷新即生效');
-  console.log('  ⏹  按 Ctrl+C 停止服务');
+  console.log('  ♻  热重载：server.json / html.json / .js 改完刷新即生效');
+  console.log('     （.navext.client.js 也会热重载，但页面有渲染缓存，需加 ?fresh=1 或关掉 cache.html 才看得到）');
+  console.log('  ⏹  按 Ctrl+C 停止服务（SIGTERM 同样支持，扩展会收到 onDispose）');
   console.log('');
 }
 
@@ -4495,11 +4526,31 @@ function main() {
   App.server.listen(cfg.port, cfg.host, () => printBanner(App, cfg));
 
   // 优雅退出
-  process.on('SIGINT', () => {
-    console.log('\n  已停止服务。\n');
+  // v2.8.1：两条退出路径统一处理，且都调用扩展的 onDispose。
+  // 之前只挂了 SIGINT 且不清理扩展，导致：
+  //   1) Ctrl+C 时扩展收不到 onDispose，定时器/挂起请求/本地状态文件不会被收尾
+  //   2) SIGTERM（docker stop / systemd / k8s 驱逐 / 裸 kill）完全没有处理
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    console.log(`\n  收到 ${signal}，正在停止服务…`);
+
+    // 逆序清理（后加载的先走），与热重载时保持一致
+    const list = (App.ext && App.ext.list) || [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      try { disposeExt(list[i]); }
+      catch (err) { console.warn(`  ⚠  [${ts()}] 清理扩展 ${list[i].id} 出错：${err.message}`); }
+    }
+
+    console.log('  已停止服务。\n');
     App.server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 1000);
-  });
+    setTimeout(() => process.exit(0), 1000).unref();
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

@@ -22,7 +22,7 @@
 | 🔗 **扩展依赖** | `requires` 声明依赖，服务端拓扑排序，缺依赖自动跳过 |
 | 📊 **扩展统计** | `stats()` 暴露运行时数据，`GET /api/extensions/:id/stats` 读取 |
 | 🌐 **ctx.fetch** | 扩展内网络请求，超时 + 重载自动 abort |
-| ⏱ **ctx.timer** | 扩展内定时器，重载自动清理 |
+| ⏱ **ctx.timer / interval** | 扩展内定时器，重载/禁用/关停自动清理。`timer` 一次性，`interval` 重复 |
 | ⏱ **钩子超时** | `extensions.timeout` 保护异步钩子，超时返回 504 |
 | 🪝 **onError 钩子** | 扩展可监听自身错误，`ctx.hook` 标明来源 |
 | 🌐 **多主页路由** | `home.routes` 按路径 / Host / 环境变量切换不同主页 |
@@ -245,6 +245,18 @@ my-project/
 | `POST /api/extensions/:id/fs/write` | 写入扩展文件 |
 
 访问开关在 server.json 的 api 字段，全部支持热重载。
+
+> ⚠️ **`api.fs.write` 默认为 `false`**，上表中的 `fs/write`、`fs/mkdir`、
+> `fs/rename`、`fs/delete` 默认返回 403。写入扩展目录的内容会被热重载并执行，
+> 而接口无鉴权，因此默认关闭。需要时显式打开：
+>
+> ```json
+> { "api": { "fs": { "write": true } } }
+> ```
+>
+> 开启前请只绑 `127.0.0.1` 或前置带鉴权的反向代理。
+> `api.writable` 默认仍为 `true`——它管的是「改扩展配置」和「toggle 启停」，
+> 写的是纯数据，无法注入可执行代码。
 
 ---
 
