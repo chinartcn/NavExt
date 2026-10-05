@@ -8,6 +8,33 @@
 
 ---
 
+> ### 📚 本文档有两个形态
+>
+> | 形态 | 适合 | 位置 |
+> | --- | --- | --- |
+> | **单文件全文**（本文件） | 通读、全文搜索（Ctrl+F） | `NavExt.md` |
+> | **按主题拆分** | 按需查阅、单篇分享 | [`MD/`](MD/README.md) |
+>
+> 两份内容同源同步，任选其一。**拆分版导航**：
+>
+> | # | 文档 | 内容 |
+> | --- | --- | --- |
+> | 01 | [快速开始](MD/01-快速开始.md) | 环境要求、开发态 / 分发态、目录结构 |
+> | 02 | [配置文件](MD/02-配置文件.md) | `server.json`、`html.json` |
+> | 03 | [扩展系统](MD/03-扩展系统.md) | 钩子、`ctx`、配置 schema、作用域、依赖、`stats` |
+> | 04 | [客户端 API](MD/04-客户端API.md) | `window.NavExt`、路径归一化、生命周期 |
+> | 05 | [服务端 API](MD/05-服务端API.md) | RESTful 接口、项目 FS、扩展 FS |
+> | 06 | [主页与路由](MD/06-主页与路由.md) | `home.routes`、子页扩展策略 |
+> | 07 | [打包与分发](MD/07-打包与分发.md) | `app.sh`、`server.dist.js`、`build.js` |
+> | 08 | [运行机制](MD/08-运行机制.md) | 热重载、命令行、请求处理链、URL 路由 |
+> | 09 | [安全边界](MD/09-安全边界.md) | 信任模型、路径防护、`vm.js` 审计 |
+> | 10 | [常见问题](MD/10-常见问题.md) | FAQ、文件清单 |
+> | 🎓 | [**教程：从零写第一个扩展**](MD/教程-从零写第一个扩展.md) | 手把手，每步可运行 |
+>
+> 另有 [`examples/`](examples/README.md) 下 5 个教学型扩展。
+
+---
+
 ## 目录
 
 - [特性](#特性)
@@ -928,7 +955,7 @@ NavExt.getActiveExtIds("/blog")                // 指定路径
 > 见 [`examples/README.md`](examples/README.md)。
 >
 > 📋 **能力缺口清单**：想知道扩展 API "做不到什么"，
-> 见 [`NavExt-扩展能力缺口清单.md`](../NavExt-扩展能力缺口清单.md)。
+> 见 [`NavExt-扩展能力缺口清单.md`](../../NavExt-扩展能力缺口清单.md)。
 
 一个「收藏夹」扩展，声明配置项、读写自己的 starred.json：
 
@@ -2827,6 +2854,8 @@ v2.4.1 修复：ctx.fetch 合并用户 signal；stats() 改回仅同步；抽 pa
 v2.4.2 ctx.fetch 成功/失败路径也释放 signal listener；文档措辞精确化
 v2.5 第一档能力 onResponse 响应钩子（可改状态/头/体）+ GET /api/search 服务端搜索 + access-stats 统计扩展
 v2.6 内置 UI + 安全审计 视图切换（按目录/按时间）+ 主题切换与自定义主题色 + html.json 隐藏条目（含 glob）+ vm.js 扩展安全沙箱检测器
+v2.7.0 扩展生命周期 + 路径归一化 服务端 onDispose 钩子；客户端 NavExt.disposer / dispose / isDisposed + pagehide/beforeunload 自动清理 + pageshow(bfcache) 重派 init；urlToRel / relToUrl / pathOf / normalizePath 双端一致（统一 URL 与相对两套路径体系）；5 个教学示例
+v2.7.1 文档拆分 NavExt.md 保留全文并加索引；新增 MD/ 目录：10 篇主题文档 + 导航首页 +《从零写第一个扩展》手把手教程
 
 ---
 

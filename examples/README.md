@@ -127,4 +127,4 @@ node cli.js create my-ext      # 交互式生成骨架
 ```
 
 然后参考本例的写法。完整的 API 参考见 [`../NavExt.md`](../NavExt.md)，
-能力缺口见 [`../../NavExt-扩展能力缺口清单.md`](../../NavExt-扩展能力缺口清单.md)。
+能力缺口见 [`../../../NavExt-扩展能力缺口清单.md`](../../../NavExt-扩展能力缺口清单.md)。
