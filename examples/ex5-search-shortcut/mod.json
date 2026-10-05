@@ -1,0 +1,8 @@
+{
+  "name": "快捷键与视图（教学）",
+  "description": "演示客户端 ui API 与键盘事件：/ 聚焦搜索、t 切换主题、v 切换视图、Esc 清空搜索",
+  "version": "1.0.0",
+  "author": "NavExt 示例",
+  "enabled": true,
+  "order": 50
+}

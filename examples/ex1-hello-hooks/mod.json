@@ -1,0 +1,8 @@
+{
+  "name": "钩子全览（教学）",
+  "description": "逐个演示 onInit / onFiles / onHtml / onRequest / onResponse / stats 六个服务端钩子的用法与执行顺序",
+  "version": "1.0.0",
+  "author": "NavExt 示例",
+  "enabled": true,
+  "order": 10
+}

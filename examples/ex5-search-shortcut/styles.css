@@ -1,0 +1,21 @@
+/* 示例 05 样式 —— 提示气泡 */
+
+.nx-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translate(-50%, 12px);
+  background: rgba(20, 24, 32, .92);
+  color: #fff;
+  font: 13px/1 -apple-system, "PingFang SC", sans-serif;
+  padding: 9px 16px;
+  border-radius: 999px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .18s, transform .18s;
+  z-index: 9999;
+}
+.nx-toast.on {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}

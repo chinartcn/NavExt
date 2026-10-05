@@ -1,0 +1,8 @@
+{
+  "name": "Markdown 渲染（教学）",
+  "description": "演示如何用 onRequest 拦截 .md 请求，读文件、转成 HTML 再返回；含配置 schema",
+  "version": "1.0.0",
+  "author": "NavExt 示例",
+  "enabled": true,
+  "order": 30
+}

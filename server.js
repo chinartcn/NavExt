@@ -101,7 +101,7 @@ const path = require('path');
 const vm = require('vm');
 
 /** 服务端版本 —— 会通过 __NAV_DATA__ 传给客户端 */
-const SERVER_VERSION = '2.4.2';
+const SERVER_VERSION = '2.7.0';
 
 /** 客户端库路径 —— 与 server.js 同目录，文件名以 . 开头，静态路由自动拒绝 */
 const NAVEXT_CLIENT_PATH = path.join(__dirname, '.navext.client.js');
@@ -342,10 +342,55 @@ function normalizeHtmlKey(key) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
+ * 软链接逃逸防护：把 target 解析成真实路径，确认仍在 baseDir 真实路径之内。
+ *
+ * 词法判断（path.resolve + path.relative）挡不住符号链接 —— 项目内一个
+ * 指向 /etc 的软链就能让 /etc-link/passwd 正常返回。这里用 realpathSync
+ * 拿到链路的最终目的地再比一次。
+ *
+ * 目标不存在时（如 write 新建文件），逐级向上找到最近的已存在祖先再校验，
+ * 避免「父目录是软链、子文件尚不存在」的绕过。
+ *
+ * @returns {true} 安全 | {error:string} 不安全
+ */
+function assertRealPathUnder(baseDir, target) {
+  let realBase;
+  try {
+    realBase = fs.realpathSync(baseDir);
+  } catch {
+    // baseDir 本身不可解析（不存在等），交给后续正常流程报错
+    return true;
+  }
+
+  // 从 target 起向上找最近的「已存在」路径
+  let probe = target;
+  let realTarget = null;
+  for (;;) {
+    try {
+      realTarget = fs.realpathSync(probe);
+      break;
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') return { error: 'path 无法解析' };
+      const parent = path.dirname(probe);
+      if (parent === probe) return true;   // 到根都没找到，放弃（不该发生）
+      probe = parent;
+    }
+  }
+
+  // 已存在部分若是软链，其真实位置必须仍在 baseDir 内
+  const r = path.relative(realBase, realTarget);
+  if (r && (r.startsWith('..') || path.isAbsolute(r))) {
+    return { error: 'path 越界（符号链接指向外部）' };
+  }
+
+  return true;
+}
+
+/**
  * 把 relPath 解析到 baseDir 下，越界返回 { error }
  * @returns {{full:string, rel:string} | {error:string}}
  */
-function fsResolveUnder(baseDir, relPath) {
+function fsResolveUnder(baseDir, relPath, opts) {
   if (relPath === undefined || relPath === null) relPath = '';
   if (typeof relPath !== 'string') return { error: 'path 必须是字符串' };
   if (relPath.includes('\0')) return { error: 'path 含非法字符' };
@@ -359,6 +404,12 @@ function fsResolveUnder(baseDir, relPath) {
   if (r === '' || r === '.') return { full: baseDir, rel: '' };
   if (r.startsWith('..') || path.isAbsolute(r)) return { error: 'path 越界' };
 
+  // 词法通过后，再做一次真实路径校验（软链接防护）
+  if (!(opts && opts.skipRealPath)) {
+    const safe = assertRealPathUnder(baseDir, target);
+    if (safe !== true) return safe;
+  }
+
   return { full: target, rel: r.replace(/\\/g, '/') };
 }
 
@@ -370,7 +421,7 @@ function fsGetType(st) {
   return 'other';
 }
 
-/** 静态资源路径解析（拒绝任何以 . 开头的路径段） */
+/** 静态资源路径解析（拒绝任何以 . 开头的路径段；并做软链接逃逸校验） */
 function resolveStaticPath(pathname, root) {
   if (pathname.includes('\0')) return null;
 
@@ -383,6 +434,9 @@ function resolveStaticPath(pathname, root) {
 
   const segments = r.split(path.sep);
   if (segments.some((seg) => seg.startsWith('.'))) return null;
+
+  // 符号链接可能把路径带出 root，必须按真实路径再验一次
+  if (assertRealPathUnder(root, target) !== true) return null;
 
   return target;
 }
@@ -744,13 +798,42 @@ function buildConfig(cli, configPath) {
 
   const cfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
 
+  // 收集被静默修正/丢弃的配置项，启动时统一提示，避免「改了配置没生效」的无从排查
+  const cfgWarnings = [];
+  const warnCfg = (key, val, why) => {
+    const shown = typeof val === 'object' ? JSON.stringify(val) : String(val);
+    cfgWarnings.push(`${key} = ${shown}  ${why}`);
+  };
+  const clampPort = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return null;
+    const i = Math.floor(n);
+    return i > 65535 ? 65535 : i;
+  };
+
   /* ── 数值与字符串 ── */
   if (fileCfg) {
-    if (fileCfg.port !== undefined) cfg.port = toInt(fileCfg.port, cfg.port);
-    if (fileCfg.depth !== undefined) cfg.depth = toInt(fileCfg.depth, cfg.depth);
-    if (typeof fileCfg.host === 'string' && fileCfg.host.trim()) cfg.host = fileCfg.host.trim();
+    if (fileCfg.port !== undefined) {
+      const p = clampPort(fileCfg.port);
+      if (p === null) warnCfg('port', fileCfg.port, `不是合法数字，已回落 ${cfg.port}`);
+      else if (p !== Number(fileCfg.port)) { cfg.port = p; warnCfg('port', fileCfg.port, `超出范围，已修正为 ${p}`); }
+      else cfg.port = p;
+    }
+    if (fileCfg.depth !== undefined) {
+      const d = toInt(fileCfg.depth, null);
+      if (d === null) warnCfg('depth', fileCfg.depth, `不是合法数字，已回落 ${cfg.depth}`);
+      else cfg.depth = d;
+    }
+    if (fileCfg.host !== undefined && !(typeof fileCfg.host === 'string' && fileCfg.host.trim())) {
+      warnCfg('host', fileCfg.host, '不是非空字符串，已忽略');
+    } else if (typeof fileCfg.host === 'string' && fileCfg.host.trim()) {
+      cfg.host = fileCfg.host.trim();
+    }
   }
-  if (cli.port !== undefined) cfg.port = toInt(cli.port, cfg.port);
+  if (cli.port !== undefined) {
+    const p = clampPort(cli.port);
+    if (p !== null) cfg.port = p;
+  }
   if (cli.depth !== undefined) cfg.depth = toInt(cli.depth, cfg.depth);
   if (cli.host !== undefined) {
     const h = String(cli.host).trim();
@@ -767,8 +850,14 @@ function buildConfig(cli, configPath) {
   }
 
   /* ── site ── */
+  if (fileCfg?.site !== undefined && !(typeof fileCfg.site === 'object' && !Array.isArray(fileCfg.site) && fileCfg.site !== null)) {
+    warnCfg('site', fileCfg.site, '不是 JSON 对象，已忽略');
+  }
   if (fileCfg?.site && typeof fileCfg.site === 'object' && !Array.isArray(fileCfg.site)) {
     const s = fileCfg.site;
+    if (s.accent !== undefined && !sanitizeCssColor(s.accent)) {
+      warnCfg('site.accent', s.accent, '不是合法颜色值，已忽略');
+    }
     if (typeof s.title === 'string') cfg.site.title = s.title.trim().slice(0, 200);
     if (typeof s.description === 'string') cfg.site.description = s.description.trim().slice(0, 1000);
     if (typeof s.logo === 'string') cfg.site.logo = s.logo.trim().slice(0, 16);
@@ -896,7 +985,7 @@ function buildConfig(cli, configPath) {
     }
   }
 
-  return { cfg, configFound };
+  return { cfg, configFound, warnings: cfgWarnings };
 }
 
 /** 打印配置热重载日志 */
@@ -946,12 +1035,18 @@ function getConfig(app) {
   if (app.cfg && stamp === app.cfgStamp) return app.cfg;
 
   const prev = app.cfg;
-  const { cfg, configFound } = buildConfig(app.cli, app.configPath);
+  const { cfg, configFound, warnings } = buildConfig(app.cli, app.configPath);
 
   app.cfg = cfg;
   app.cfgFound = configFound;
   app.cfgStamp = stamp;
   app.cfgVersion++;
+
+  if (warnings && warnings.length) {
+    for (const w of warnings) {
+      console.warn(`  ⚠  [${ts()}] server.json 配置被修正：${w}`);
+    }
+  }
 
   if (prev) logConfigReload(prev, cfg);
 
@@ -983,8 +1078,17 @@ function normalizeMetaEntry(v) {
 
   const title = pickString(v, ['title', 'name', 'label', 'displayName']);
   const description = pickString(v, ['description', 'desc', 'intro', 'summary', 'note']);
-  if (!title && !description) return null;
-  return { title, description };
+
+  // 隐藏标记：hidden / hide / hiddenFromNav，任意真值即隐藏
+  let hidden = false;
+  for (const k of ['hidden', 'hide', 'hiddenFromNav', 'hideFromNav', 'unlisted']) {
+    const hv = v[k];
+    if (hv === true || hv === 1 || hv === 'true' || hv === 'yes') { hidden = true; break; }
+  }
+
+  // 只带 hidden 的条目也必须保留（否则无法「仅隐藏」）
+  if (!title && !description && !hidden) return null;
+  return { title, description, hidden };
 }
 
 /** 读取一个目录下的 html.json */
@@ -1007,8 +1111,11 @@ function loadDirMeta(dir, root, warnedSet) {
   }
 
   const byFile = new Map();
+  /** glob 键（含 * 或 ?）→ { glob, entry }，需在扫描时逐文件匹配 */
+  const patterns = [];
   let dirTitle = '';
   let dirDescription = '';
+  let dirHidden = false;
 
   const put = (rawKey, entry) => {
     if (!entry) return;
@@ -1017,9 +1124,16 @@ function loadDirMeta(dir, root, warnedSet) {
     if (PATTERN.dirMetaKeys.has(key)) {
       if (entry.title) dirTitle = entry.title;
       if (entry.description) dirDescription = entry.description;
+      if (entry.hidden) dirHidden = true;
       return;
     }
     if (!key) return;
+
+    // 含通配符的键不进精确表，单独存 glob 列表
+    if (key.includes('*') || key.includes('?')) {
+      patterns.push({ glob: key.toLowerCase(), entry });
+      return;
+    }
 
     byFile.set(key, entry);
     const base = key.split('/').pop();
@@ -1037,7 +1151,7 @@ function loadDirMeta(dir, root, warnedSet) {
     for (const [key, val] of Object.entries(data)) put(key, normalizeMetaEntry(val));
   }
 
-  return { byFile, dirTitle, dirDescription };
+  return { byFile, patterns, dirTitle, dirDescription, dirHidden };
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1231,6 +1345,100 @@ function parseListEntries(listData) {
 
   for (const [id, val] of Object.entries(listData)) push(id, val);
   return out;
+}
+
+/* ── 路径归一化工具（v2.7）──────────────────────────────────────────────
+ * NavExt 内部存在两套路径体系，扩展作者极易踩坑：
+ *   · URL 体系（请求侧）  ：'/docs/a.html'，首页为 '/'
+ *   · 相对体系（文件侧）  ：'docs/a.html'，首页为 'index.html'
+ * 下面两个函数做双向无损归一化，服务端与客户端行为保持一致。
+ * 客户端同名 API：NavExt.urlToRel() / NavExt.relToUrl() / NavExt.normalizePath()
+ * ────────────────────────────────────────────────────────────────────── */
+
+/** 是否有 .html/.htm 后缀（视为"文件路径"而非目录路径） */
+function hasHtmlExt(p) {
+  return /\.html?$/i.test(String(p));
+}
+
+/**
+ * 去查询串/哈希，decode，压缩重复斜杠，去掉所有 './' 段。
+ * 不做大小写转换（大小写敏感文件系统上不能丢信息）。
+ */
+function cleanPathInput(p) {
+  let s = String(p == null ? '' : p);
+  const hash = s.indexOf('#');
+  if (hash >= 0) s = s.slice(0, hash);
+  const q = s.indexOf('?');
+  if (q >= 0) s = s.slice(0, q);
+  try { s = decodeURIComponent(s); } catch { /* 非法转义：保留原样 */ }
+  s = s.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  // 去掉所有 './' 段（开头与中间）
+  s = s.replace(/(^|\/)\.\//g, '$1');
+  while (s.startsWith('../')) s = s.slice(3);
+  return s;
+}
+
+/**
+ * URL 路径 → 相对路径（供与 getFiles()[].path 对齐）
+ *   '/docs/a.html' → 'docs/a.html'
+ *   '/docs/'       → 'docs/index.html'
+ *   '/'            → 'index.html'
+ *   'docs/a.html'  → 'docs/a.html'   （已是相对路径则原样规范）
+ *   'index.html'   → 'index.html'
+ *
+ * @param {string} p
+ * @param {string} [indexName='index.html'] 目录默认文件名
+ */
+function urlToRel(p, indexName) {
+  const idx = indexName || 'index.html';
+  let s = cleanPathInput(p);
+  const isUrl = String(p == null ? '' : p).charAt(0) === '/' || s === '' || s.charAt(0) === '/';
+  s = s.replace(/^\/+/, '');
+
+  if (s === '') return isUrl ? idx : '';
+  if (s.endsWith('/')) return s + idx;
+  if (hasHtmlExt(s)) return s;
+  // 无后缀：请求侧是"目录/站点别名"，文件侧补默认文档名
+  if (isUrl) return s + '/' + idx;
+  return s;
+}
+
+/**
+ * 相对路径 → URL 路径
+ *   'docs/a.html' → '/docs/a.html'
+ *   'index.html'  → '/'
+ *   ''            → '/'
+ *   '/docs/a.html'→ '/docs/a.html'（已是 URL 则原样规范）
+ *   'docs'        → '/docs'
+ *
+ * @param {string} p
+ * @param {string} [indexName='index.html']
+ */
+function relToUrl(p, indexName) {
+  const idx = indexName || 'index.html';
+  let s = cleanPathInput(p);
+  const alreadyUrl = String(p == null ? '' : p).charAt(0) === '/';
+  s = s.replace(/^\/+/, '');
+
+  if (s === '') return '/';
+  if (s === idx) return '/';
+  if (s.endsWith('/' + idx)) return '/' + s.slice(0, -idx.length);
+  return '/' + s;
+}
+
+/** 归一化成"可比较的 key"（仅用于相等/包含判断，不产生新路径） */
+function normalizePathKey(p, indexName) {
+  return urlToRel(p, indexName).toLowerCase();
+}
+
+/**
+ * 把任意一侧的路径统一到 URL 体系。已是 URL 则原样（首页保持 '/'）。
+ * 供扩展 ctx.pathOf() 使用。
+ */
+function toUrlPath(p, indexName) {
+  const raw = String(p == null ? '' : p);
+  if (raw.charAt(0) === '/') return relToUrl(urlToRel(raw, indexName), indexName);
+  return relToUrl(raw, indexName);
 }
 
 /** 判断扩展是否匹配当前请求路径。无 scope = 全部允许 */
@@ -1494,7 +1702,11 @@ function loadExtensions(cfg) {
 
     const dir = path.join(jsDir, name);
     let st;
-    try { st = fs.statSync(dir); } catch { continue; }
+    try { st = fs.statSync(dir); }
+    catch {
+      console.warn(`  ⚠  [${ts()}] js.list.json 引用的扩展不存在：${name}`);
+      continue;
+    }
     if (!st.isDirectory()) continue;
 
     const mod = readJsonSafe(path.join(dir, 'mod.json')) || {};
@@ -1561,7 +1773,18 @@ function registerDisposable(ext, disposeFn) {
 
 /** 清理扩展的所有资源：定时器、挂起请求等 */
 function disposeExt(ext) {
+  // v2.7：先调用扩展自己的 onDispose（让扩展有机会收尾），再清理内核托管的资源
+  if (ext.server && typeof ext.server.onDispose === 'function') {
+    try {
+      const c = ext._lastCtx || {};
+      ext.server.onDispose(c);
+    } catch (err) {
+      console.warn(`  ⚠  [${ts()}] 扩展 ${ext.id} onDispose 出错：${err.message}`);
+    }
+  }
+
   if (!ext._disposables || !ext._disposables.size) return;
+
   for (const fn of ext._disposables) {
     try { fn(); }
     catch (err) {
@@ -1722,7 +1945,7 @@ function makeExtCtx(app, ext, base, req) {
     return _bodyPromise;
   };
 
-  return Object.assign({}, base, {
+  const ctx = Object.assign({}, base, {
     extId: ext.id,
     extDir: ext.dir,
     root: app.cfg ? app.cfg.root : '',
@@ -1750,7 +1973,16 @@ function makeExtCtx(app, ext, base, req) {
     readJson: () => _readRaw().then(parseJsonBody),
     log: (...args) => console.log(`  [ext:${ext.id}]`, ...args),
     warn: (...args) => console.warn(`  [ext:${ext.id}]`, ...args),
+
+    // ── 路径归一化（v2.7）：统一 URL 体系与相对体系的割裂 ──
+    pathOf: (p) => toUrlPath(p),
+    urlToRel: (p) => urlToRel(p),
+    relToUrl: (p) => relToUrl(p),
   });
+
+  // 保留最近一次 ctx：扩展重载/禁用时 onDispose 需要它
+  ext._lastCtx = ctx;
+  return ctx;
 }
 
 /** 给 Promise 加超时（ms <= 0 表示禁用） */
@@ -1784,6 +2016,7 @@ function notifyExtError(app, ext, err, hook, baseCtx) {
   } catch (e2) {
     console.warn(`  ⚠  [${ts()}] 扩展 ${ext.id} onError 出错：${e2.message}`);
   }
+  // onError 是最后一道防线，它自己出错时不能再往上抛
 }
 
 /** 应用 onFiles 钩子 */
@@ -1795,6 +2028,13 @@ function applyOnFiles(app, files, ctx) {
     try {
       const r = fn(result, makeExtCtx(app, ext, ctx));
       if (Array.isArray(r)) result = r;
+      else if (r && typeof r.then === 'function') {
+        // 钩子返回 Promise：吞掉异常，避免变成 unhandledRejection
+        r.catch((err) => {
+          console.warn(`  ⚠  [${ts()}] 扩展 ${ext.id} onFiles 异步出错：${err.message}`);
+          notifyExtError(app, ext, err, 'onFiles', ctx);
+        });
+      }
     } catch (err) {
       console.warn(`  ⚠  [${ts()}] 扩展 ${ext.id} onFiles 出错：${err.message}`);
       notifyExtError(app, ext, err, 'onFiles', ctx);
@@ -1815,7 +2055,9 @@ async function applyOnHtml(app, html, ctx) {
     const fn = ext.server?.onHtml;
     if (typeof fn !== 'function') continue;
     try {
-      let r = fn(result, makeExtCtx(app, ext, ctx));
+      // 用 Promise.resolve 统一包裹：同步抛出与异步 reject 走同一条 catch，
+      // 扩展内浮空 Promise 的异常也不会漏到进程级
+      let r = await Promise.resolve(fn(result, makeExtCtx(app, ext, ctx)));
       if (r && typeof r.then === 'function') {
         r = await withTimeout(r, timeout, `扩展 ${ext.id} onHtml 超时`);
       }
@@ -1839,7 +2081,8 @@ async function applyOnRequest(app, req, url, ctx) {
     const fn = ext.server?.onRequest;
     if (typeof fn !== 'function') continue;
     try {
-      let r = fn(req, url, makeExtCtx(app, ext, ctx, req));
+      // 同上：同步抛出与异步 reject 统一走这条 catch
+      let r = await Promise.resolve(fn(req, url, makeExtCtx(app, ext, ctx, req)));
       if (r && typeof r.then === 'function') {
         r = await withTimeout(r, timeout, `扩展 ${ext.id} onRequest 超时`);
       }
@@ -1859,6 +2102,44 @@ async function applyOnRequest(app, req, url, ctx) {
     }
   }
   return null;
+}
+
+/**
+ * 应用 onResponse 钩子（v2.5）—— 请求已完成后的观察者，不可改写响应。
+ *
+ * 与 onRequest 的区别：onRequest 在处理前、可拦截；onResponse 在响应写出后，
+ * 只用于埋点/统计/日志等副作用，返回值被忽略。这样扩展能做访问统计、
+ * 慢请求告警、访问日志，而不必把整个响应抢下来自己实现。
+ *
+ * 注意：此钩子在响应已发送后触发，绝不能尝试写 res —— 统一传一个只读快照。
+ */
+function applyOnResponse(app, info, baseCtx) {
+  const exts = app.ext.list;
+  if (!exts.length) return;
+
+  for (const ext of exts) {
+    const fn = ext.server?.onResponse;
+    if (typeof fn !== 'function') continue;
+    if (!extMatchesScope(ext, info.pathname)) continue;
+
+    try {
+      const ctx = makeExtCtx(app, ext, baseCtx || {});
+      ctx.pathname = info.pathname;
+      ctx.hook = 'onResponse';
+      // 同步钩子：返回值不参与后续处理
+      const r = fn(info, ctx);
+      if (r && typeof r.then === 'function') {
+        // 异步 onResponse 不阻塞请求收尾，异常就地吞掉
+        r.then(undefined, (err) => {
+          console.warn(`  ⚠  [${ts()}] 扩展 ${ext.id} onResponse 异步出错：${err.message}`);
+          notifyExtError(app, ext, err, 'onResponse', baseCtx);
+        });
+      }
+    } catch (err) {
+      console.warn(`  ⚠  [${ts()}] 扩展 ${ext.id} onResponse 出错：${err.message}`);
+      notifyExtError(app, ext, err, 'onResponse', baseCtx);
+    }
+  }
 }
 
 /** 收集所有扩展的注入内容 */
@@ -1966,6 +2247,9 @@ function scanHtml(app, cfg, extSet, extDirName, dir, base, depth, out, dirMeta, 
     dirMeta.set(base, { title: localMeta.dirTitle, description: localMeta.dirDescription });
   }
 
+  // 目录级隐藏：@dir 带 hidden:true → 本目录下所有文件标记隐藏（级联到子目录由递归自然继承）
+  const dirHidden = !!(localMeta && localMeta.dirHidden);
+
   for (const ent of entries) {
     const name = ent.name;
     if (name.startsWith('.')) continue;
@@ -1997,6 +2281,17 @@ function scanHtml(app, cfg, extSet, extDirName, dir, base, depth, out, dirMeta, 
     if (localMeta) entry = localMeta.byFile.get(lname) || localMeta.byFile.get(lrel) || null;
     if (!entry && rootMeta) entry = rootMeta.byFile.get(lrel) || rootMeta.byFile.get(lname) || null;
 
+    // glob 匹配（本地元数据优先，其次根元数据）
+    if (!entry && localMeta && localMeta.patterns.length) {
+      entry = matchMetaPatterns(localMeta.patterns, lname, lrel);
+    }
+    if (!entry && rootMeta && rootMeta.patterns.length) {
+      entry = matchMetaPatterns(rootMeta.patterns, lname, lrel);
+    }
+
+    // hidden 来源：文件级（精确/glob）或目录级级联
+    const hidden = dirHidden || !!(entry && entry.hidden);
+
     out.push({
       rel,
       name,
@@ -2005,8 +2300,17 @@ function scanHtml(app, cfg, extSet, extDirName, dir, base, depth, out, dirMeta, 
       mtime: st.mtimeMs,
       title: entry ? entry.title : '',
       description: entry ? entry.description : '',
+      hidden,
     });
   }
+}
+
+/** 在 glob 规则列表中找出第一条命中的元数据 */
+function matchMetaPatterns(patterns, lname, lrel) {
+  for (const p of patterns) {
+    if (matchGlob(lname, p.glob) || matchGlob(lrel, p.glob)) return p.entry;
+  }
+  return null;
 }
 
 /** 获取当前扫描结果（带缓存与热重载） */
@@ -2146,10 +2450,12 @@ ${cards}
 </section>`;
 }
 
-/** 按目录分组 */
-function groupFilesByDir(files) {
+/** 按目录分组（默认跳过 hidden 文件） */
+function groupFilesByDir(files, opts) {
+  const includeHidden = !!(opts && opts.includeHidden);
   const groups = new Map();
   for (const f of files) {
+    if (f.hidden && !includeHidden) continue;
     const key = f.dir || '';
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(f);
@@ -2180,6 +2486,8 @@ function buildNavData(app, files, cfg, pathname) {
       description: f.description || '',
       size: f.size,
       mtime: f.mtime,
+      // hidden 项仍下发（带标记），供扩展按需识别；核心渲染与搜索默认忽略
+      hidden: !!f.hidden,
     })),
     config: {
       site: cfg.site,
@@ -2222,7 +2530,9 @@ function serializeNavData(data) {
 async function renderNav(app, files, dirMeta, cfg, pathname) {
   const SITE = cfg.site;
 
-  const groups = groupFilesByDir(files);
+  // 导航页不展示 hidden 项（hidden 页 URL 仍可访问，见 resolveStaticPath）
+  const visibleFiles = files.filter((f) => !f.hidden);
+  const groups = groupFilesByDir(visibleFiles);
   const dirKeys = sortDirKeys([...groups.keys()]);
 
   let totalBytes = 0;
@@ -2239,7 +2549,7 @@ async function renderNav(app, files, dirMeta, cfg, pathname) {
   const logoHtml = SITE.logo ? `<span class="logo" data-ext-target="site-logo">${escapeHtml(SITE.logo)}</span>` : '';
   const siteDesc = SITE.description ? `<p class="sitedesc" data-ext-target="site-desc">${escapeHtml(SITE.description)}</p>` : '';
   const statsHtml = SITE.showStats
-    ? `<span class="stat" data-ext-target="stats">${files.length} 个文件 · ${dirKeys.length} 个目录 · ${formatSize(totalBytes)}</span>`
+    ? `<span class="stat" data-ext-target="stats">${visibleFiles.length} 个文件 · ${dirKeys.length} 个目录 · ${formatSize(totalBytes)}</span>`
     : '';
   const accentCss = SITE.accent
     ? `--brand:${SITE.accent};--brand-ring:color-mix(in srgb,${SITE.accent} 18%,transparent);` : '';
@@ -2362,6 +2672,7 @@ function buildHtml(p) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
 <title>${escapeHtml(p.pageTitle)}</title>
+<script data-ext-target="theme-boot">${THEME_BOOT_SCRIPT}</script>
 ${BASE_STYLE(p.accentCss)}
 ${p.headInject}
 </head>
@@ -2409,22 +2720,66 @@ ${p.footerInject}
 </html>`;
 }
 
+/**
+ * 主题防闪脚本 —— 必须在 <head> 内、BASE_STYLE 之前同步执行。
+ * 只做两件事：读 localStorage 设 data-theme、设 --brand。
+ * 保持极短小，避免阻塞首屏渲染。
+ */
+const THEME_BOOT_SCRIPT = `(function(){try{
+var d=document.documentElement,s=localStorage;
+var t=s.getItem('navext.theme');
+if(t==='dark'||t==='light')d.setAttribute('data-theme',t);
+var a=s.getItem('navext.accent');
+if(a&&/^#[0-9a-f]{6}$/i.test(a))d.style.setProperty('--brand',a);
+}catch(e){}})();`;
+
 /** 基础样式（常量） */
 function BASE_STYLE(accentCss) {
-  return `<style>
-  :root{
-    ${accentCss}
+  // 亮/暗两套变量抽成可复用的字面量，供三档主题（跟随/亮/暗）共用。
+  // 注意：--brand / --brand-ring 不写死在这里 —— 它们由 accentCss（站点配置）
+  // 或防闪脚本（用户自定义）提供，末尾用 var() 兜底到默认色。
+  const LIGHT_VARS = `
     --bg:#f5f6fa; --card:#ffffff; --text:#1e2430; --muted:#7a8496;
-    --line:#e6e9f0; --brand:#4f6ef7; --header-bg:rgba(245,246,250,.86);
+    --line:#e6e9f0; --header-bg:rgba(245,246,250,.86);
     --chip:rgba(127,127,127,.11);
-    --shadow:0 1px 2px rgba(16,24,40,.04), 0 8px 20px -12px rgba(16,24,40,.25);
+    --shadow:0 1px 2px rgba(16,24,40,.04), 0 8px 20px -12px rgba(16,24,40,.25);`;
+
+  const DARK_VARS = `
+    --bg:#0f1218; --card:#171b23; --text:#e6e9ef; --muted:#8b94a6;
+    --line:#252b36; --header-bg:rgba(15,18,24,.86);
+    --chip:rgba(255,255,255,.08);
+    --shadow:0 1px 2px rgba(0,0,0,.35), 0 8px 24px -12px rgba(0,0,0,.8);`;
+
+  // 站点配置的主题色（若未配置则为空）
+  const brandVars = accentCss || '';
+
+  // 兜底色：仅当既无站点配置、也无用户自定义时生效。
+  // 放在 :root 末尾，用 !important 之外的方式无法让"后声明的 accentCss"生效，
+  // 所以这里改为「accentCss 覆盖兜底」——兜底先写，站点色后写。
+  const BRAND_FALLBACK = `--brand:#4f6ef7;--brand-ring:rgba(79,110,247,.16);`;
+
+  return `<style>
+  /* 默认（跟随系统）：先铺亮色，再由媒体查询覆盖 */
+  :root{
+    color-scheme:light dark;
+    ${BRAND_FALLBACK}
+    ${brandVars}
+    ${LIGHT_VARS}
   }
+  /* 显式亮色：强制亮色，屏蔽媒体查询 */
+  :root[data-theme="light"]{
+    color-scheme:light;
+    ${LIGHT_VARS}
+  }
+  /* 显式暗色：强制暗色 */
+  :root[data-theme="dark"]{
+    color-scheme:dark;
+    ${DARK_VARS}
+  }
+  /* 跟随系统：仅在未显式指定主题时生效 */
   @media (prefers-color-scheme: dark){
-    :root{
-      --bg:#0f1218; --card:#171b23; --text:#e6e9ef; --muted:#8b94a6;
-      --line:#252b36; --header-bg:rgba(15,18,24,.86);
-      --chip:rgba(255,255,255,.08);
-      --shadow:0 1px 2px rgba(0,0,0,.35), 0 8px 24px -12px rgba(0,0,0,.8);
+    :root:not([data-theme]){
+      ${DARK_VARS}
     }
   }
   *{box-sizing:border-box}
@@ -2545,30 +2900,54 @@ function BASE_STYLE(accentCss) {
 const CORE_SEARCH_SCRIPT = `
 (function () {
   var input    = document.getElementById('q');
-  var sections = Array.prototype.slice.call(document.querySelectorAll('section'));
   var noresult = document.getElementById('noresult');
 
   function applyFilter() {
     var kw = input.value.trim().toLowerCase();
     var visible = 0;
 
+    // 动态查询：内置 UI 可能新增/移除容器（如时间视图的平铺容器），
+    // 因此不能缓存 section 列表。必须限定在 main 内 —— 否则会误伤
+    // 页面其它位置的 <section>（如内置 UI 的主题面板）。
+    var mainEl = document.querySelector('main[data-ext-target="main"]');
+    var sections = mainEl
+      ? Array.prototype.slice.call(mainEl.querySelectorAll('section'))
+      : Array.prototype.slice.call(document.querySelectorAll('section'));
+
+    var inSection = new Set();
     sections.forEach(function (sec) {
       var n = 0;
       sec.querySelectorAll('[data-ext-target="card"]').forEach(function (card) {
+        inSection.add(card);
         var hit = !kw || (card.dataset.key || '').indexOf(kw) !== -1;
         card.hidden = !hit;
         if (hit) n++;
       });
-      sec.hidden = n === 0;
+      // 空容器（如未使用的平铺容器）不参与「无结果」判定
+      var isEmptyHost = sec.hasAttribute('data-nx-timewrap') && !sec.querySelector('[data-ext-target="card"]');
+      // 只翻转"卡片分组"外壳的显隐，别碰其它 section
+      if (sec.hasAttribute('data-ext-target')) {
+        sec.hidden = (n === 0) && !isEmptyHost;
+      }
       visible += n;
     });
 
-    noresult.hidden = visible !== 0 || sections.length === 0;
+    document.querySelectorAll('[data-ext-target="card"]').forEach(function (card) {
+      if (inSection.has(card)) return;
+      var hit = !kw || (card.dataset.key || '').indexOf(kw) !== -1;
+      card.hidden = !hit;
+      if (hit) visible++;
+    });
+
+    noresult.hidden = visible !== 0;
 
     if (window.NavExt) window.NavExt._notifyCardsChanged();
   }
 
   input.addEventListener('input', applyFilter);
+
+  // 供内置 UI 在切换视图后重新应用当前搜索词（卡片被移动过）
+  window.__NAVEX_FILTER__ = applyFilter;
 
   document.addEventListener('keydown', function (e) {
     if (e.key === '/' && document.activeElement !== input) {
@@ -2758,6 +3137,89 @@ function serveStatic(req, res, filePath) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /* ---- 扩展管理 ---- */
+
+/**
+ * 服务端搜索（v2.5）—— GET /api/search?q=&limit=&dir=
+ *
+ * 在内核里只提供"按字段匹配已扫描文件"这一最小能力。更复杂的检索
+ * （全文索引、相关性排序、外部数据源）应由扩展用 onRequest 覆盖此路径实现。
+ *
+ * 匹配字段：name / rel / title / description / dir，全部大小写不敏感。
+ * 打分：标题命中 > 文件名命中 > 路径命中 > 描述命中，命中位置越靠前分越高。
+ */
+function handleSearch(app, res, url) {
+  const q = (url.searchParams.get('q') || '').trim();
+  const limitRaw = toInt(url.searchParams.get('limit'), 50);
+  const limit = Math.min(Math.max(limitRaw || 50, 1), 500);
+  const dirFilter = (url.searchParams.get('dir') || '').trim().replace(/^\/+|\/+$/g, '');
+
+  if (!q) {
+    return sendJson(res, 400, { error: '缺少查询参数 q' });
+  }
+
+  const { files } = getState(app);
+  const needle = q.toLowerCase();
+  const terms = needle.split(/\s+/).filter(Boolean);
+  // 默认排除 hidden 项；?hidden=1 可包含
+  const includeHidden = url.searchParams.has('hidden') && url.searchParams.get('hidden') !== '0';
+
+  // 打分：越关键的字段权重越高；命中越靠前加权越大
+  const scoreField = (val, weight) => {
+    if (!val) return 0;
+    const v = String(val).toLowerCase();
+    const idx = v.indexOf(needle);
+    if (idx === -1) {
+      // 多词查询：所有词都出现在该字段才算命中
+      if (terms.length > 1 && terms.every((t) => v.includes(t))) return weight * 0.5;
+      return 0;
+    }
+    const posBonus = 1 / (1 + idx / 8);   // 越靠前越接近 1
+    return weight * posBonus;
+  };
+
+  const scored = [];
+  for (const f of files) {
+    if (f.hidden && !includeHidden) continue;
+    if (dirFilter && f.dir !== dirFilter) continue;
+
+    let score = 0;
+    score += scoreField(f.title, 10);
+    score += scoreField(f.name, 6);
+    score += scoreField(f.rel, 4);
+    score += scoreField(f.description, 2);
+
+    // 多词查询要求全部词都命中（跨字段），避免召回噪声
+    if (score > 0 && terms.length > 1) {
+      const hay = `${f.title}\n${f.name}\n${f.rel}\n${f.description}`.toLowerCase();
+      if (!terms.every((t) => hay.includes(t))) continue;
+    }
+
+    if (score > 0) scored.push({ f, score });
+  }
+
+  scored.sort((a, b) => (b.score - a.score) || a.f.rel.localeCompare(b.f.rel, 'zh-Hans-CN', { numeric: true }));
+
+  const total = scored.length;
+  const items = scored.slice(0, limit).map(({ f, score }) => ({
+    rel: f.rel,
+    name: f.name,
+    dir: f.dir,
+    title: f.title,
+    description: f.description,
+    size: f.size,
+    mtime: f.mtime,
+    score: Math.round(score * 100) / 100,
+  }));
+
+  return sendJson(res, 200, {
+    query: q,
+    total,
+    count: items.length,
+    limit,
+    truncated: total > items.length,
+    items,
+  });
+}
 
 function apiExtensionsList(app, cfg) {
   const jsDir = getExtDir(cfg);
@@ -3306,6 +3768,12 @@ async function handleApi(app, req, res, url, pathname) {
     return handleToggleExtension(app, req, res);
   }
 
+  /* GET /api/search?q=&limit= —— 服务端搜索（v2.5） */
+  if (pathname === '/api/search') {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: '只支持 GET' });
+    return handleSearch(app, res, url);
+  }
+
   /* /api/fs/* */
   if (pathname === '/api/fs/list' || pathname === '/api/fs/stat' || pathname === '/api/fs/read') {
     if (!cfg.api.fs.read) return sendJson(res, 403, { error: '文件系统读取已禁用' });
@@ -3427,10 +3895,14 @@ async function handleApi(app, req, res, url, pathname) {
 function handleNavJson(app, res, url) {
   const force = url.searchParams.has('fresh') || url.searchParams.has('refresh');
   const { cfg, files, dirMeta, configPath, configFound } = getState(app, force);
+  // 默认排除 hidden；?hidden=1 可包含
+  const includeHidden = url.searchParams.has('hidden') && url.searchParams.get('hidden') !== '0';
+  const shown = includeHidden ? files : files.filter((f) => !f.hidden);
 
   return sendJson(res, 200, {
     root: cfg.root,
-    count: files.length,
+    count: shown.length,
+    hiddenCount: files.length - shown.length,
     generatedAt: new Date().toISOString(),
     config: {
       source: configFound ? configPath : null,
@@ -3449,7 +3921,7 @@ function handleNavJson(app, res, url) {
     dirs: [...dirMeta.entries()].map(([dir, info]) => ({
       dir, title: info.title || '', description: info.description || '',
     })),
-    files: files.map((f) => ({
+    files: shown.map((f) => ({
       path: f.rel,
       url: '/' + encodePath(f.rel),
       dir: f.dir,
@@ -3458,6 +3930,7 @@ function handleNavJson(app, res, url) {
       description: f.description || '',
       size: f.size,
       mtime: new Date(f.mtime).toISOString(),
+      hidden: !!f.hidden,
     })),
   });
 }
@@ -3544,6 +4017,40 @@ async function handleNavHtml(app, req, res, url) {
 
 /** 顶层请求处理 */
 async function handleRequest(app, req, res) {
+  /* v2.5: 统一的响应观察点 —— 挂 res.end，覆盖所有出口（含错误页、静态文件流） */
+  const t0 = process.hrtime.bigint();
+  let sentStatus = 0;
+  let sentBytes = 0;
+  let recorded = false;
+
+  const _writeHead = res.writeHead;
+  res.writeHead = function (statusCode, ...args) {
+    sentStatus = statusCode;
+    return _writeHead.call(this, statusCode, ...args);
+  };
+
+  const _end = res.end;
+  res.end = function (chunk, ...args) {
+    if (!recorded) {
+      recorded = true;
+      if (chunk) sentBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+      if (!sentStatus) sentStatus = res.statusCode || 200;
+      const durMs = Number(process.hrtime.bigint() - t0) / 1e6;
+      // 快照：扩展绝不能碰 res，只给只读信息
+      applyOnResponse(app, {
+        method: req.method,
+        pathname: res.__navextPathname || '/',
+        url: req.url,
+        status: sentStatus,
+        bytes: sentBytes,
+        durationMs: Math.round(durMs * 100) / 100,
+        headers: req.headers,
+        start: Date.now(),
+      }, { root: app.cfg ? app.cfg.root : '', configPath: app.configPath });
+    }
+    return _end.call(this, chunk, ...args);
+  };
+
   let url;
   try { url = new URL(req.url, 'http://localhost'); }
   catch {
@@ -3557,6 +4064,9 @@ async function handleRequest(app, req, res) {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('400 Bad Request: 非法的 URL 编码');
   }
+
+  // 供 onResponse 使用（放在解码成功后）
+  res.__navextPathname = pathname;
 
   const ext = getExtensions(app);
   const cfg = getConfig(app);
@@ -3634,6 +4144,7 @@ function printHelp() {
 
 服务端 API:
   GET    /api/config                            当前配置 + 目录元数据
+  GET    /api/search?q=<kw>                     服务端搜索文件（支持 limit / dir）
   GET    /api/extensions                        所有扩展
   GET    /api/extensions/:id                    单个扩展详情
   POST   /api/extensions/toggle                 切换启用状态
@@ -3651,6 +4162,7 @@ function printHelp() {
 
 客户端 API (window.NavExt):
   数据    getFiles / getFile / getConfig / getExtensions
+  搜索    search(q, {limit, dir})
   配置    getExtConfig / getExtConfigSchema / setExtConfig / resetExtConfig
   FS      fs.list / fs.read / fs.stat / fs.exists
   Net     fetch(url, opts)  — 带超时 + 扩展重载自动 abort
@@ -3768,6 +4280,26 @@ function printBanner(app, cfg) {
 
 /** 启动入口 —— 唯一的顶层逻辑 */
 function main() {
+  // ── 进程级兜底：扩展在钩子里漏 catch 的异步异常，不该拖垮整个服务 ──
+  // 同步 try/catch 挡不住微任务里抛出的异常（如 onRequest 内浮空 Promise），
+  // Node 15+ 默认直接终止进程。这里兜住并保持服务可用。
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason && reason.message ? reason.message : String(reason);
+    console.error(`  ⚠  [${ts()}] 未处理的 Promise 拒绝（已忽略，服务继续运行）：${msg}`);
+    if (process.env.NAVEXT_DEBUG && reason && reason.stack) {
+      console.error(reason.stack.replace(/^/gm, '       '));
+    }
+  });
+
+  process.on('uncaughtException', (err) => {
+    console.error(`  ⚠  [${ts()}] 未捕获异常（已忽略，服务继续运行）：${err && err.message}`);
+    if (process.env.NAVEXT_DEBUG && err && err.stack) {
+      console.error(err.stack.replace(/^/gm, '       '));
+    }
+    // 监听器自身出错导致 ERR_SERVER_ALREADY_LISTEN 等致命配置错误时，
+    // 静默续跑没有意义，交给原有错误路径
+  });
+
   // 检查客户端库（不存在直接失败，避免启动后才报错）
   if (typeof NAVEXT_CLIENT_INLINE === "undefined" && !fs.existsSync(NAVEXT_CLIENT_PATH)) {
     console.error('');

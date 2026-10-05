@@ -1,0 +1,8 @@
+{
+  "name": "阅读时长与热度（教学）",
+  "description": "演示 onResponse 埋点 + stats 暴露指标 + 配置 schema：统计每页访问量、平均耗时，并在卡片上按热度着色",
+  "version": "1.0.0",
+  "author": "NavExt 示例",
+  "enabled": true,
+  "order": 40
+}

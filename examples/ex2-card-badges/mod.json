@@ -1,0 +1,8 @@
+{
+  "name": "卡片标记（教学）",
+  "description": "演示客户端 API：给卡片加图标、徽章、自定义属性，并按文件大小/修改时间着色",
+  "version": "1.0.0",
+  "author": "NavExt 示例",
+  "enabled": true,
+  "order": 20
+}

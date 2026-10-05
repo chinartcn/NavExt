@@ -1,0 +1,12 @@
+/* 示例 02 样式 —— 超大文件标红 */
+
+.nx-large-file {
+  border-color: #e5484d !important;
+}
+
+.nx-large-file [data-ext-target="card-title"]::after {
+  content: " 大";
+  font-size: 0.7em;
+  color: #e5484d;
+  vertical-align: super;
+}

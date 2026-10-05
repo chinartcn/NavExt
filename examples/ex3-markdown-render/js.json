@@ -1,0 +1,21 @@
+{
+  "styles": "styles.css",
+  "scripts": "client.js",
+  "config": {
+    "accentHeading": {
+      "type": "color",
+      "label": "标题颜色",
+      "description": "渲染出的 Markdown 标题用什么颜色",
+      "default": "#4f6ef7"
+    },
+    "maxBytes": {
+      "type": "number",
+      "label": "最大渲染字节数",
+      "description": "超过该大小的 .md 不渲染，直接提示过大（防大文件卡住页面）",
+      "default": 262144,
+      "min": 1024,
+      "max": 5242880,
+      "step": 1024
+    }
+  }
+}

@@ -24,6 +24,7 @@
  *   -r, --root <dir>      指定根目录
  *   -y, --yes             使用默认值
  *   -f, --force           覆盖已存在
+ *   -V, --version         显示版本号
  *       --no-color        关闭彩色输出
  */
 
@@ -61,6 +62,15 @@ const MOD_FILE    = 'mod.json';
 const JS_FILE     = 'js.json';
 const INDEX_FILE  = 'index.js';
 const NAME_RE     = /^[a-zA-Z0-9_-]+$/;
+
+/** 版本号单一事实来源 —— 从同目录 package.json 读取，失败则回落硬编码 */
+const NAVEXT_VERSION = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || '2.6.0';
+  } catch {
+    return '2.6.0';
+  }
+})();
 
 /* ============================================================ */
 /*  基础工具                                                     */
@@ -179,6 +189,9 @@ function tmplIndexJs(name) {
  *   onFiles(files, ctx)       扫描完成后调用，返回数组则替换文件列表
  *   onHtml(html, ctx)         HTML 生成后调用，返回字符串则替换 HTML
  *   onRequest(req, url, ctx)  请求路由前调用，返回对象则拦截并作为响应
+ *   onResponse(info, ctx)     响应写出后调用，只做副作用（埋点/统计/日志），
+ *                             不能改写响应。info = { method, pathname, url,
+ *                             status, bytes, durationMs, headers, start }
  *
  * ctx 里可以直接读:
  *   ctx.config            合并后的配置值
@@ -192,6 +205,11 @@ module.exports = {
   onInit(ctx) {
     ctx.log('已加载');
   },
+
+  // onResponse(info, ctx) {
+  //   // 例：统计访问量，再通过 stats() 暴露给 /api/extensions/<id>/stats
+  //   ctx.log(info.method + ' ' + info.pathname + ' → ' + info.status + ' (' + info.durationMs + 'ms)');
+  // },
 };
 `;
 }
@@ -1112,6 +1130,7 @@ function printHelp() {
     -y, --yes             使用默认值
     -f, --force           覆盖已存在
         --no-color        关闭彩色输出
+    -V, --version         显示版本号
     -h, --help            显示帮助
 
   ${bold('示例')}
@@ -1153,7 +1172,7 @@ function printHelp() {
 /* ============================================================ */
 
 function parseArgs(argv) {
-  const opts = { root: process.cwd(), yes: false, force: false, help: false };
+  const opts = { root: process.cwd(), yes: false, force: false, help: false, version: false };
   const rest = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -1162,6 +1181,7 @@ function parseArgs(argv) {
     else if (a.startsWith('--root='))     opts.root = a.slice(7);
     else if (a === '-y' || a === '--yes') opts.yes = true;
     else if (a === '-f' || a === '--force') opts.force = true;
+    else if (a === '-V' || a === '--version') opts.version = true;
     else if (a === '--no-color')          process.env.NO_COLOR = '1';
     else if (a === '-h' || a === '--help') opts.help = true;
     else if (a.startsWith('-'))           { /* 未知选项 */ }
@@ -1178,6 +1198,11 @@ function parseArgs(argv) {
 
 async function main() {
   const { opts, rest } = parseArgs(process.argv.slice(2));
+
+  if (opts.version) {
+    console.log(`navext v${NAVEXT_VERSION}`);
+    return;
+  }
 
   if (opts.help || rest.length === 0) {
     printHelp();

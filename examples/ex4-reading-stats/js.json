@@ -1,0 +1,25 @@
+{
+  "scripts": "client.js",
+  "config": {
+    "hotThreshold": {
+      "type": "number",
+      "label": "热门阈值（次）",
+      "description": "访问次数达到该值的页面会被标为「热门」",
+      "default": 5,
+      "min": 1,
+      "max": 1000,
+      "step": 1
+    },
+    "hotColor": {
+      "type": "color",
+      "label": "热门徽章颜色",
+      "default": "#e0447c"
+    },
+    "trackApi": {
+      "type": "boolean",
+      "label": "统计 API 请求",
+      "description": "是否把 /api/* 也计入",
+      "default": false
+    }
+  }
+}

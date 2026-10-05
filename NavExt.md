@@ -21,7 +21,9 @@
   - [扩展统计（stats）](#扩展统计stats)
   - [ctx.fetch / ctx.timer](#ctxfetch--ctxtimer)
   - [扩展作用域](#扩展作用域)
+  - [扩展安全审计 — vm.js](#扩展安全审计--vmjs)
 - [客户端 API — window.NavExt](#客户端-api--windownavext)
+- [内置 UI 功能（v2.6）](#内置-ui-功能v26)
 - [服务端 API](#服务端-api)
 - [自定义主页](#自定义主页)
 - [子页扩展策略](#子页扩展策略)
@@ -44,18 +46,22 @@
 | 🗂 **自动扫描** | 递归扫描目录，按目录分组展示所有 HTML |
 | 🔍 **实时搜索** | 按名称/介绍/路径搜索，`/` 聚焦、`Esc` 清空 |
 | 🎨 **外观定制** | 标题、描述、logo、页脚、主题色全部可配 |
-| 📝 **文件描述** | `html.json` 为任意 HTML 添加标题和介绍 |
+| 📝 **文件描述** | `html.json` 为任意 HTML 添加标题和介绍，支持 glob 通配与隐藏标记 |
+| 🕒 **视图切换** | 导航页一键在「按目录 / 按时间」之间切换，时间视图带相对时间徽标 |
+| 🌗 **主题切换** | 跟随系统 / 亮色 / 暗色三档 + 自定义主题色，首屏无闪烁 |
 | 🧩 **JS 扩展** | 插件系统，可注入样式/脚本、拦截请求、读写文件、声明配置项 |
 | 🎛 **扩展配置** | 扩展声明配置 schema，用户在浏览器里改，无需动代码 |
 | 💾 **文件 API** | 项目目录只读，扩展目录读写 |
 | ♻️ **全量热重载** | 配置、元数据、扩展、HTML、客户端库，改完全部即时生效 |
-| 🌗 **自动暗色** | 跟随系统 `prefers-color-scheme` |
+| 🕶 **隐藏条目** | `html.json` 的 `hidden: true` 让页面不进列表但 URL 仍可访问 |
 | 📦 **零依赖** | 仅用 Node.js 内置模块 |
 | 📡 **API 齐全** | RESTful 服务端 API + `window.NavExt` 客户端 API |
 | 🛡 **路径安全** | 防目录穿越、防 CSS 注入、无软链死循环 |
 | 📦 **单文件分发** | 打包成 `app.sh`，客户端库、HTML、扩展全内联，对方 `./app.sh` 即运行 |
 | 🌐 **多主页路由** | `home.routes` 按路径 / Host / 环境变量切换不同主页 |
 | 🎯 **扩展作用域** | `js.list.json` 按路径精细控制扩展生效范围 |
+| ♻️ **扩展生命周期** | `onDispose`（服务端）+ `NavExt.disposer`（客户端），禁用/卸载自动清理 |
+| 🧭 **路径归一化** | `urlToRel` / `relToUrl` / `pathOf`，统一 URL 与相对两套路径体系 |
 
 ## 快速开始
 
@@ -310,23 +316,54 @@ dist/
 
 key 说明：
 
-key 说明
-"@dir" 该目录分组本身的标题和介绍，大小写不敏感（@DIR / @Dir 均可）
-文件名 如 "index.html"，不区分大小写
-相对路径 如 "sub/page.html"，可跨目录匹配
+| key | 含义 |
+|---|---|
+| `"@dir"` | 该目录分组本身的标题和介绍，大小写不敏感（`@DIR` / `@Dir` 均可） |
+| 文件名 | 如 `"index.html"`，不区分大小写 |
+| 相对路径 | 如 `"sub/page.html"`，可跨目录匹配 |
+| **glob 通配** | 如 `"draft-*.html"`、`"*.tmp.html"`、`"api-?.html"`，支持 `*` 与 `?` |
 
 value 写法：
 
-· 字符串 → 等价于 { "title": 该字符串 }
-· 对象 → { "title": "...", "description": "..." }
+- 字符串 → 等价于 `{ "title": 该字符串 }`
+- 对象 → `{ "title": "...", "description": "...", "hidden": true }`
 
 字段别名：
 
-主字段 别名
-title name、label、displayName
-description desc、intro、summary、note
+| 主字段 | 别名 |
+|---|---|
+| title | name、label、displayName |
+| description | desc、intro、summary、note |
+| hidden | hide、hiddenFromNav、hideFromNav、unlisted |
 
-匹配优先级：文件所在目录的 html.json > 根目录的 html.json。未配置的 HTML 仍会列出，显示原始文件名。
+匹配优先级：文件所在目录的 `html.json` > 根目录的 `html.json`。未配置的 HTML 仍会列出，显示原始文件名。
+
+#### 隐藏条目（v2.6）
+
+给条目加 `hidden: true`，它会**从导航页与 JSON 列表中移除，但 URL 仍可正常访问（HTTP 200）**。
+适合"想分享链接、但不想让它出现在公开列表里"的页面。
+
+```json
+{
+  "secret.html": { "hidden": true },
+  "draft-*.html": { "hidden": true },
+  "@dir": { "hidden": true }
+}
+```
+
+- **文件级**：精确名 / 相对路径 / glob 命中且带 `hidden` → 该文件隐藏。
+- **目录级**：该目录的 `@dir` 带 `hidden: true` → 目录下**所有**文件隐藏（并级联到子目录）。
+- 隐藏项仍会出现在 `window.__NAV_DATA__.files` 里并带 `"hidden": true`，方便扩展按需处理。
+
+**与 `ignoreFiles` 的语义区别**（重要）：
+
+| 机制 | 导航页 | URL 访问 | 适用场景 |
+|---|---|---|---|
+| `server.json` 的 `ignoreFiles` | 不显示 | **404** | 彻底排除（构建产物、模板等） |
+| `html.json` 的 `hidden: true` | 不显示 | **200 可访问** | 有链接但不进列表 |
+
+**API 行为**：`/?format=json` 与 `/api/search` 默认**排除**隐藏项；
+加 `?hidden=1` 可包含（`/?format=json` 另返回 `hiddenCount` 便于统计）。
 
 ---
 
@@ -458,10 +495,12 @@ module.exports = {
 | 钩子 | 触发时机 | 返回值 |
 | --- | --- | --- |
 | `onInit(ctx)` | 扩展加载后 | 无 |
-| `onFiles(files, ctx)` | 扫描完成后 | 数组则替换文件列表 |
+| `onFiles(files, ctx)` | 扫描完成后 | 数组则替换文件列表（**必须同步**） |
 | `onHtml(html, ctx)` | 页面 HTML 生成后 | 字符串则替换 HTML |
 | `onRequest(req, url, ctx)` | 路由分发前 | 对象则拦截响应（任意 HTTP 方法） |
+| `onResponse(info, ctx)` | 响应已发出后 | 无（只读观察者） |
 | `onError(err, ctx)` | 扩展钩子出错后 | 无 |
+| `onDispose(ctx)` | 扩展重载 / 禁用 / 关停 | 无（收尾清理，`v2.7.0` 新增） |
 | `stats()` | — | 返回统计数据，由 GET /api/extensions/:id/stats 读取 |
 
 onRequest 返回对象的结构：
@@ -492,9 +531,34 @@ ctx 上下文对象：
   pathname,                          // onRequest 时有
   fs: { ... },                       // 见下文 ctx.fs
   log(...args),                      // 带 [ext:hello] 前缀
-  warn(...args)
+  warn(...args),
+
+  // ── 路径归一化（v2.7.0）──
+  pathOf(p),                         // 任意一侧 → 统一 URL 体系
+  urlToRel(p),                       // URL → 相对路径（'/' → 'index.html'）
+  relToUrl(p),                       // 相对 → URL（'index.html' → '/'）
 }
 ```
+
+**路径归一化（v2.7.0）**：NavExt 内部有两套路径体系，扩展做「按文件关联」时极易踩坑：
+
+| 体系 | 来源 | 首页 | 示例 |
+| --- | --- | --- | --- |
+| URL 体系 | `onRequest` / `onResponse` 的 `pathname` | `/` | `/docs/a.html` |
+| 相对体系 | `getFiles()[].path` | `index.html` | `docs/a.html` |
+
+服务端经 `ctx`、客户端经 `NavExt` 暴露同一组函数，**两实现行为严格一致**：
+
+```js
+ctx.urlToRel('/docs/a.html')   // → 'docs/a.html'
+ctx.urlToRel('/')              // → 'index.html'
+ctx.urlToRel('/docs/')         // → 'docs/index.html'
+ctx.relToUrl('index.html')     // → '/'
+ctx.relToUrl('a/index.html')   // → '/a/'
+ctx.pathOf('docs/a.html')      // → '/docs/a.html'（统一到 URL 体系）
+```
+
+服务端读文件用**相对**路径、记录请求用**URL**路径时，用 `ctx.pathOf()` 对齐两者即可。
 
 ctx.config 是合并后的配置值，服务端直接读即可；ctx.userConfig 是用户显式覆盖的部分，ctx.configSchema 是 schema。客户端对应的是 NavExt.getExtConfig(id) / getExtConfigSchema(id)。
 
@@ -664,6 +728,48 @@ dir 扩展根目录绝对路径
 
 所有方法都经过路径校验，越界时抛异常。
 
+> ⚠️ **`ctx.fs` 是便利封装，不是安全边界。**
+> 它只防止"手滑写错路径"，**不能**阻止扩展直接用原生 `fs` 读写任意文件。
+> 扩展装入 `.js/` 后即以服务器进程权限运行 —— **安装第三方扩展 = 完全信任其作者**，
+> 与安装 npm 包同级。装前请务必用 `vm.js` 审计（见下节）。
+
+### 扩展安全审计 — vm.js
+
+`vm.js` 是一个**零依赖、可独立运行**的扩展安全沙箱检测器：把扩展放进隔离的 `vm` 上下文里**真实执行**，
+但其中的 `require` / `fs` / `child_process` / `fetch` / `net` / `process.env` 全部换成**只记录、不执行的仿真实现**——
+扩展以为自己在攻击，实际只是在向审计器"交代意图"。**全程无任何真实副作用。**
+
+它能对抗**字符串拼接混淆**：静态扫描看不见 `require('child_process')` 时，运行时照样拦得住。
+
+```bash
+node vm.js .js/copy-link          # 审计单个扩展
+node vm.js --all                  # 审计 .js/ 下全部扩展
+node vm.js .js/x --json           # 输出机器可读 JSON
+node vm.js --all --strict         # 可疑(Suspicious)也视为失败，用于 CI 门禁
+node vm.js .js/x --timeout 5000   # 自定义单次运行超时（默认 3000ms）
+```
+
+评级采用三档（对齐腾讯云鼎实验室标准）：
+
+| 等级 | 分值 | 含义 |
+| --- | --- | --- |
+| 🔴 Malicious | 0–30 | 存在明确恶意特征，**严禁使用** |
+| ⚠️ Suspicious | 31–75 | 存在风险行为，需人工复核 |
+| ✅ Benign | 76–100 | 未发现风险行为 |
+
+退出码：`0` 全部可信 / `1` 存在可疑（仅 `--strict`）/ `2` 存在恶意。
+
+也可作为模块被内核或工具调用：
+
+```js
+const { auditExtension, auditDirectory } = require('./vm.js');
+const r = auditExtension('.js/copy-link');   // → { level, score, maliciousFindings, ... }
+```
+
+**局限（诚实声明）**：异步钩子里（`Promise`/`setTimeout` 回调）的危险动作同步超时窗口覆盖不到，
+此时依赖静态扫兜底；`vm` 模块本身并非强安全边界，无法保证 100% 阻隔**主动逃逸**。
+本工具用于**判定"这个扩展是否可信"**，而非**"在不可信代码旁边安全运行"**。
+
 ### 扩展作用域
 
 默认情况下扩展在所有页面生效。如果某个扩展只应该在特定路径下工作——比如"只在 /docs 下显示"、"除了 /admin 外都生效"——用 `js.list.json` 的 `scope` 声明。
@@ -816,6 +922,13 @@ NavExt.getActiveExtIds("/blog")                // 指定路径
 
 ---
 ### 完整扩展示例
+
+> 💡 **更多可运行的示例**：仓库 `examples/` 目录下有 5 个教学型扩展，
+> 覆盖服务端钩子、客户端卡片 API、Markdown 渲染、访问统计、键盘快捷键。
+> 见 [`examples/README.md`](examples/README.md)。
+>
+> 📋 **能力缺口清单**：想知道扩展 API "做不到什么"，
+> 见 [`NavExt-扩展能力缺口清单.md`](../NavExt-扩展能力缺口清单.md)。
 
 一个「收藏夹」扩展，声明配置项、读写自己的 starred.json：
 
@@ -1062,6 +1175,56 @@ var f = NavExt.getFile('docs/index.html');
 var f2 = NavExt.getFile('/DOCS/INDEX.HTML');   // 路径不区分大小写
 ```
 
+### 路径归一化（v2.7.0）
+
+服务端与客户端各一份、**行为严格一致**的实现：
+
+| 方法 | 说明 | 示例 |
+| --- | --- | --- |
+| `urlToRel(p)` | URL → 相对路径 | `'/docs/a.html'` → `'docs/a.html'`；`'/'` → `'index.html'` |
+| `relToUrl(p)` | 相对 → URL | `'docs/a.html'` → `'/docs/a.html'`；`'index.html'` → `'/'` |
+| `pathOf(p)` | 任意一侧 → 统一 URL 体系 | `'docs/a.html'` → `'/docs/a.html'` |
+| `normalizePath(p)` | → 可比较的 key（小写） | `'/DOCS/A.HTML'` 与 `'docs/a.html'` 归一后相等 |
+
+```js
+// 典型场景：服务端 stats() 的键是相对路径，客户端拿它是 URL 路径
+var key = NavExt.normalizePath('/docs/a.html');       // 'docs/a.html'
+var n = stats.counts[key];                            // 正确命中
+```
+
+### 生命周期（v2.7.0）
+
+扩展被禁用或页面卸载时，`setInterval` / `addEventListener` / `fetch` 轮询**不会自动停止**。
+用 `disposer` 把清理函数托管给内核，即可避免泄漏：
+
+| 方法 | 说明 |
+| --- | --- |
+| `disposer(extId, fn)` | 注册清理函数，返回取消注册的函数；省略 `extId` 时为全局 `'*'` |
+| `dispose(extId)` | 手动执行清理（幂等，不二次执行），并移除该扩展注入的 CSS |
+| `isDisposed(extId)` | 是否已清理 |
+
+**自动清理时机**：`pagehide` / `beforeunload` 触发时，内核执行所有扩展的清理函数，
+并派发 `ext-disposed`（单个扩展）与 `navext-unload`（全局）事件。bfcache 恢复（`pageshow`）时
+重派 `init`，扩展可重建。
+
+```js
+var EXT_ID = 'my-ext';
+
+var timer = setInterval(refresh, 30000);
+var offCards = NavExt.on('cards-rendered', refresh);
+
+NavExt.disposer(EXT_ID, function () {
+  clearInterval(timer);
+  offCards();
+});
+
+// 需要提前清理时（例如扩展自己判断已失效）：
+// NavExt.dispose(EXT_ID);
+```
+
+> 服务端对称能力：`onDispose(ctx)` 钩子 + `ctx.timer` / `ctx.interval`（重载时内核自动清理）。
+> 客户端此前缺的正是这个对称能力，v2.7.0 已补齐。
+
 ### 扩展配置
 
 | 方法 | 说明 |
@@ -1221,6 +1384,68 @@ document.querySelectorAll('[data-ext-target="card"]').forEach(function (card) {
   console.log(card.dataset.extFile, card.dataset.extPath, card.dataset.extTitle);
 });
 ```
+
+---
+
+## 内置 UI 功能（v2.6）
+
+导航页自带两个开箱即用的交互增强，**纯客户端、零依赖**，由内置客户端库提供，
+无需任何扩展或配置。它们的状态都存在 `localStorage`，刷新后保持。
+
+### 视图切换：按目录 / 按时间
+
+搜索框下方有一组 `[按目录] [按时间]` 分段控件。
+
+- **按目录**（默认）：保持服务端渲染的目录分组结构。
+- **按时间**：把所有卡片按 `data-ext-mtime` **降序**平铺到一个网格容器中，
+  并给每张卡片追加相对时间徽标（"3 天前"）。原目录分组外壳**保留在 DOM 中（仅隐藏）**，
+  所以依赖 `[data-ext-target="section"]` 的扩展不会失效。
+
+状态键：`localStorage.navext.view`（`dir` | `time`）。
+
+```js
+NavExt.ui.setView('time');   // 切到时间视图
+NavExt.ui.getView();         // → 'dir' | 'time'
+NavExt.on('view-changed', function (e) { console.log(e.view); });
+```
+
+实现要点：切换时通过移动 DOM 节点（而非重建）改变归属，随后调用
+`NavExt.notifyCardsChanged()` 让扩展重新索引；同时会重放当前搜索词。
+
+### 主题切换 + 自定义主题色
+
+头部右侧「外观」按钮打开一个弹出面板：
+
+| 项 | 说明 |
+|---|---|
+| 主题三档 | **跟随系统** / **亮色** / **暗色**，状态键 `localStorage.navext.theme` |
+| 预设色板 | 8 个精选主题色，点击即应用 |
+| 取色器 | `<input type="color">` 自定义任意颜色 |
+| 恢复默认 | 清除自定义色，回落到 `server.json` 的 `site.accent`（未配置则用默认 `#4f6ef7`） |
+
+主题色优先级：**`localStorage.navext.accent` > `server.json` 的 `site.accent` > 内置默认 `#4f6ef7`**。
+
+实现要点：
+
+- 「跟随系统」= 移除 `<html data-theme>`，由 `@media (prefers-color-scheme: dark)` 接管；
+  显式亮/暗 = 设 `data-theme="light"` / `data-theme="dark"`，同时声明 `color-scheme`
+  让滚动条与原生控件跟随。
+- **无闪烁（FOUC）**：`<head>` 最前面有一段极短的同步脚本（`data-ext-target="theme-boot"`），
+  在样式表之前读取 `localStorage` 并设好 `data-theme` 与 `--brand`，因此首帧即为正确主题。
+
+```js
+NavExt.ui.setTheme('dark');      // 'system' | 'light' | 'dark'
+NavExt.ui.setAccent('#10a37f');  // 传 null 恢复默认
+NavExt.ui.getTheme();            // → 'system'
+NavExt.ui.getAccent();           // → '#4f6ef7'
+NavExt.ui.presets;               // 预设色板 [{name, color}, ...]
+NavExt.on('theme-changed', function (e) { console.log(e.theme); });
+NavExt.on('accent-changed', function (e) { console.log(e.accent); });
+```
+
+> **扩展如何配合**：内置 UI 会随着 `cards-rendered` 幂等挂载。
+> 扩展的自定义样式请使用 `var(--brand)` / `var(--brand-ring)` 等 CSS 变量，
+> 这样在用户切换主题色时会自动跟随。查看 `[data-nx-view]`（`main` 上）可判断当前视图。
 
 ---
 
@@ -2408,9 +2633,10 @@ module.exports = {
 | 路径 | 说明 |
 | --- | --- |
 | `/` | 导航页，或 `home` 配置的自定义主页 |
-| `/?format=json` | JSON 格式的文件列表 + 配置 + 扩展信息 |
+| `/?format=json` | JSON 格式的文件列表 + 配置 + 扩展信息（默认不含 `hidden` 项，附 `hiddenCount`） |
+| `/?format=json&hidden=1` | 同上，但包含 `html.json` 中标记为隐藏的条目 |
 | `/?fresh=1` | 强制重新扫描，绕过缓存 |
-| `/<path>/<file>.html` | 直接访问静态文件 |
+| `/<path>/<file>.html` | 直接访问静态文件（隐藏页同样可访问，返回 200） |
 | `/<path>/` | 目录访问，自动尝试 `index.html` |
 
 ---
@@ -2432,7 +2658,29 @@ module.exports = {
 | **JSON 注入** | `serializeNavData` 转义 `<` `>` `\u2028` `\u2029` |
 | **脚本注入** | `safeScript` 转义 `</script>` |
 
-扩展的权限：扩展的 index.js 运行在服务端进程里，和 server.js 权限相同。ctx.fs 是便利封装，扩展依然可以 require('fs') 访问任意路径。只加载你信任的扩展。
+### 扩展 = 完全信任
+
+扩展的 `index.js` 运行在 **服务端进程里，与 `server.js` 权限完全相同**。
+`ctx.fs` 只是便利封装 —— 扩展依然可以直接 `require('fs')` 访问任意路径、`require('child_process')` 执行命令。
+
+实测（沙箱探针）证明，运行中的扩展可以：
+
+| 行为 | 实际运行时 |
+| --- | --- |
+| `require('child_process')` | ✅ 可加载 |
+| `child_process.execSync('id')` | ✅ 返回 `uid=0(root)` |
+| 原生 `fs.readFileSync('/etc/passwd')` | ✅ 可读取 |
+| `process.env` | ✅ 全部环境变量可见 |
+| `ctx.fs.read('../../../etc/passwd')` | 🚫 抛出"路径越界" |
+
+> **安装第三方扩展 = 完全信任其作者**，与安装 npm 包同级。
+> 这不是缺陷（任何插件系统都如此），但必须知情。
+
+**装前请用 `vm.js` 审计**（见 [扩展安全审计 — vm.js](#扩展安全审计--vmjs)）：
+
+```bash
+node vm.js --all .js --strict && echo "全部通过"   # CI 门禁，有恶意/可疑即失败
+```
 
 ---
 
@@ -2536,6 +2784,7 @@ server.js ✅ 服务端脚本
 .navext.client.js ✅ 客户端库，与 server.js 同目录
 build.js ❌ 合并脚本，用于生成单文件版本
 cli.js ❌ 扩展管理 + 构建命令封装
+vm.js ❌ 扩展安全沙箱检测器（零依赖，可独立运行）
 server.dist.js ❌ 生成产物，可分发的单文件
 app.tar.gz ❌ 打包产物（pack 生成）
 app.sh ❌ 单文件自解压（sfx 生成）
@@ -2548,6 +2797,7 @@ html.json ❌ 目录/文件元数据
 .js/<name>/index.js ❌ 扩展服务端逻辑
 .js/<name>/client.js ❌ 扩展客户端脚本
 .js/<name>/styles.css ❌ 扩展样式
+examples/ ❌ 教学型示例扩展（5 个，可复制到 .js/ 运行）
 
 ---
 
@@ -2575,6 +2825,8 @@ v2.3.0 扩展依赖 requires（拓扑排序）+ 扩展统计 stats() + GET /api/
 v2.4.0 ctx.fetch / ctx.timer / ctx.interval / ctx.clearTimer —— 扩展重载时自动清理资源
 v2.4.1 修复：ctx.fetch 合并用户 signal；stats() 改回仅同步；抽 parseJsonBody；客户端加 getExtStats
 v2.4.2 ctx.fetch 成功/失败路径也释放 signal listener；文档措辞精确化
+v2.5 第一档能力 onResponse 响应钩子（可改状态/头/体）+ GET /api/search 服务端搜索 + access-stats 统计扩展
+v2.6 内置 UI + 安全审计 视图切换（按目录/按时间）+ 主题切换与自定义主题色 + html.json 隐藏条目（含 glob）+ vm.js 扩展安全沙箱检测器
 
 ---
 
