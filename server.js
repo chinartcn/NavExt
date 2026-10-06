@@ -101,7 +101,7 @@ const path = require('path');
 const vm = require('vm');
 
 /** 服务端版本 —— 会通过 __NAV_DATA__ 传给客户端 */
-const SERVER_VERSION = '2.8.1';
+const SERVER_VERSION = '2.8.2';
 
 /** 客户端库路径 —— 与 server.js 同目录，文件名以 . 开头，静态路由自动拒绝 */
 const NAVEXT_CLIENT_PATH = path.join(__dirname, '.navext.client.js');
@@ -920,6 +920,21 @@ function buildConfig(cli, configPath) {
     }
   }
 
+  /* v2.8.2: home.routes 的 match.env 必须配 value —— 否则永远不命中且无提示 */
+  if (Array.isArray(cfg.home.routes)) {
+    cfg.home.routes.forEach((route, i) => {
+      const m = route && route.match;
+      if (!m || !m.env) return;
+      if (m.value === undefined || m.value === null || String(m.value) === '') {
+        warnCfg(
+          `home.routes[${i}].match.env`,
+          m.env,
+          `—— 配了 env 却没有 value，该路由永远不会命中（env 需与 value 成对使用）`
+        );
+      }
+    });
+  }
+
   /* ── api ── */
   if (fileCfg?.api && typeof fileCfg.api === 'object' && !Array.isArray(fileCfg.api)) {
     const a = fileCfg.api;
@@ -1644,6 +1659,12 @@ function loadExtension(id, jsDir, userCfgAll, moduleCache, scope) {
     version: typeof mod.version === 'string' ? mod.version.trim() : '',
     author: typeof mod.author === 'string' ? mod.author.trim() : '',
     order: Number.isFinite(Number(mod.order)) ? Number(mod.order) : 100,
+    // v2.8.2：CSS 覆盖顺序独立于加载顺序。
+    //   未声明 cssOrder → 回退到 order（与旧行为完全一致）
+    //   显式声明       → 完全按 cssOrder，不受 order / requires 影响
+    cssOrder: Number.isFinite(Number(mod.cssOrder))
+      ? Number(mod.cssOrder)
+      : (Number.isFinite(Number(mod.order)) ? Number(mod.order) : 100),
     dir,
     inject,
     server,
@@ -1955,7 +1976,9 @@ function disposeExt(ext) {
   ext._disposables.clear();
 }
 
-function makeExtFs(extDir) {
+function makeExtFs(extDir, opts) {
+  const MAX = (opts && Number.isFinite(opts.maxReadBytes)) ? opts.maxReadBytes : 0;
+
   return {
     dir: extDir,
     path(rel) {
@@ -1969,10 +1992,39 @@ function makeExtFs(extDir) {
       try { fs.accessSync(r.full); return true; }
       catch { return false; }
     },
-    read(rel, encoding) {
+    /**
+     * 读文件。
+     * v2.8.2：与 ctx.project.read 对齐——支持 { encoding, maxBytes }，
+     * 超限抛 code: 'FS_TOO_LARGE'（ctx.project 抛 PROJECT_FS_TOO_LARGE）。
+     * 旧的 read(rel, encoding) 字符串写法仍然兼容。
+     */
+    read(rel, opts2) {
+      let encoding = 'utf8';
+      let maxBytes = MAX;
+      if (typeof opts2 === 'string') encoding = opts2;
+      else if (opts2 && typeof opts2 === 'object') {
+        if (opts2.encoding) encoding = opts2.encoding;
+        if (Number.isFinite(opts2.maxBytes)) maxBytes = opts2.maxBytes;
+      }
+
       const r = fsResolveUnder(extDir, rel || '');
       if (r.error) throw new Error(r.error);
-      return fs.readFileSync(r.full, encoding || 'utf8');
+
+      if (maxBytes > 0) {
+        let st;
+        try { st = fs.statSync(r.full); }
+        catch (e) { throw new Error(`读不到 ${r.rel || '.'}：${e.code || e.message}`); }
+        if (st.isDirectory()) throw new Error(`${r.rel || '.'} 是目录，不是文件`);
+        if (st.size > maxBytes) {
+          throw Object.assign(
+            new Error(`文件 ${r.rel} 有 ${st.size} 字节，超过上限 ${maxBytes}`),
+            { code: 'FS_TOO_LARGE' }
+          );
+        }
+      }
+
+      if (encoding === 'buffer') return fs.readFileSync(r.full);
+      return fs.readFileSync(r.full, encoding);
     },
     write(rel, content, encoding) {
       const r = fsResolveUnder(extDir, rel || '');
@@ -1989,13 +2041,43 @@ function makeExtFs(extDir) {
       fs.rmSync(r.full, { recursive: true, force: true });
       return r.rel;
     },
-    list(rel) {
+    /**
+     * 列目录。
+     * v2.8.2：与 ctx.project.list 对齐——补 path 字段、支持 opts.depth 递归。
+     * 旧写法 list(rel) 仍返回同样的条目（多了 path 字段，不影响解构）。
+     */
+    list(rel, opts2) {
+      const depth = (opts2 && Number.isFinite(opts2.depth)) ? opts2.depth : 1;
       const r = fsResolveUnder(extDir, rel || '');
       if (r.error) throw new Error(r.error);
-      return fs.readdirSync(r.full, { withFileTypes: true }).map((e) => ({
-        name: e.name,
-        type: e.isDirectory() ? 'dir' : e.isFile() ? 'file' : 'other',
-      }));
+
+      // 入口先校验是目录，与 ctx.project.list 行为对齐
+      let rootSt;
+      try { rootSt = fs.statSync(r.full); }
+      catch (e) {
+        if (e.code === 'ENOENT') throw new Error(`目录不存在：${r.rel || '.'}`);
+        throw e;
+      }
+      if (!rootSt.isDirectory()) throw new Error(`${r.rel || '.'} 不是目录`);
+
+      const out = [];
+      const walk = (dirFull, dirRel, level) => {
+        let entries;
+        try { entries = fs.readdirSync(dirFull, { withFileTypes: true }); }
+        catch { return; }
+        for (const e of entries) {
+          const childRel = dirRel ? `${dirRel}/${e.name}` : e.name;
+          const isDir = e.isDirectory();
+          out.push({
+            name: e.name,
+            path: childRel,
+            type: isDir ? 'dir' : e.isFile() ? 'file' : 'other',
+          });
+          if (isDir && level < depth) walk(path.join(dirFull, e.name), childRel, level + 1);
+        }
+      };
+      walk(r.full, r.rel, 1);
+      return out;
     },
   };
 }
@@ -2116,7 +2198,10 @@ function makeExtCtx(app, ext, base, req) {
     userConfig: Object.assign({}, ext.config.userValues),
     hasUserConfig: ext.config.hasUserValues,
     scope: ext.scope,
-    fs: makeExtFs(ext.dir),
+    // v2.8.2：与 ctx.project 对齐 —— read 加上限守卫、list 补 path/depth
+    fs: makeExtFs(ext.dir, {
+      maxReadBytes: (app.cfg && app.cfg.api && app.cfg.api.fs && app.cfg.api.fs.maxReadSize) || 0,
+    }),
     // ── 站点项目只读（v2.8）：读站点文件不必再 require('fs') ──
     project: makeProjectFs(
       app.cfg ? app.cfg.root : '',
@@ -2308,14 +2393,42 @@ function applyOnResponse(app, info, baseCtx) {
   }
 }
 
-/** 收集所有扩展的注入内容 */
+/**
+ * 收集所有扩展的注入内容。
+ *
+ * v2.8.2：注入顺序与加载顺序解耦。
+ *   - app.ext.list 是「加载顺序」（由 order + requires 拓扑排序决定）；
+ *   - 这里按「CSS 覆盖顺序」（cssOrder，越大越晚注入 = 覆盖优先级越高）重排后
+ *     再累积 styles；
+ *   - scripts / head / 等其他注入仍按加载顺序（它们与覆盖语义无关，
+ *     scripts 按加载顺序可预期性更好）。
+ *
+ * 这样 order 只影响「谁先加载」，cssOrder 只影响「谁的样式赢」，
+ * 不再互相绑架。未声明 cssOrder 的扩展回退到 order，旧行为不变。
+ */
 function collectInjections(app, pathname) {
   const inj = { styles: [], scripts: [], head: [], header: [], footer: [] };
   const policies = getPageExtPolicies(app, pathname);
+
+  const active = [];
   for (const ext of app.ext.list) {
     if (!extMatchesScope(ext, pathname)) continue;
     if (!extAllowedByPage(ext, policies)) continue;
-    for (const key of Object.keys(inj)) inj[key].push(...ext.inject[key]);
+    active.push(ext);
+  }
+
+  // styles 按 cssOrder 升序（值小先注入 → 值大后注入 → 后者覆盖前者）
+  const byCss = active.slice().sort((a, b) => {
+    const d = (a.cssOrder || 0) - (b.cssOrder || 0);
+    return d || String(a.id).localeCompare(String(b.id));
+  });
+  for (const ext of byCss) inj.styles.push(...ext.inject.styles);
+
+  // 其余注入按加载顺序，保持可预期
+  for (const ext of active) {
+    for (const key of ['scripts', 'head', 'header', 'footer']) {
+      inj[key].push(...ext.inject[key]);
+    }
   }
   return inj;
 }

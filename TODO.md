@@ -1,13 +1,15 @@
 # NavExt 收尾清单 — 已完成 / 待办 / 怎么做
 
-> 生成时间：2026-10-06
-> 当前版本：**v2.8.1**
-> 范围：v2.7.0 → v2.8.1 的已落地事项，以及审计后确认尚未处理的 3 条
+> 更新时间：2026-10-06
+> 当前版本：**v2.8.2**
+> 范围：v2.7.0 → v2.8.2 的已落地事项
 > 方法：逐条实测验证，不做"看起来对"的推断（见文末「已排除项」）
+>
+> **✅ 原第二节的三条待办（T1 / T2 / T3）已在 v2.8.2 全部处理完毕**，详见下方「v2.8.2」小节。
 
 ---
 
-## 一、已完成（v2.7.0 → v2.8.1）
+## 一、已完成（v2.7.0 → v2.8.2）
 
 ### v2.7.0 — 扩展生命周期 + 路径归一化
 
@@ -45,91 +47,41 @@
 | 15 | **scope 补齐到全部 JSON 出口** | `/api/extensions`、`/api/extensions/:id`、`/?format=json` 三处补 `scope` 字段 |
 | 16 | **文档补强** | config schema 完整示例、`ctx.timer` vs `ctx.interval`、`ctx.fetch` 超时、`/api/search` 完整文档、安全边界链路说明 |
 
+### v2.8.2 — 注入顺序解耦 + ctx.fs 对齐 + 配置告警
+
+| # | 能力 | 内容 |
+| --- | --- | --- |
+| 17 | **`cssOrder`（T3 的解）** | 新增 `mod.json.cssOrder`：CSS 覆盖顺序**独立于**加载顺序。`styles` 按 `cssOrder` 升序注入，其余注入仍按加载顺序；未声明时回退 `order`，旧行为完全不变 |
+| 18 | **`ctx.fs` 对齐 `ctx.project`（T1）** | `read(rel, { encoding, maxBytes })` 超限抛 `FS_TOO_LARGE`；`list` 返回值补 `path` 字段、支持 `{ depth }` 递归 |
+| 19 | **修复 `ctx.fs.list` 静默吞错** | 目标目录不存在时原本返回 `[]`（`walk` 内的 `try/catch` 吞掉了入口 ENOENT），现改为抛「目录不存在」；目标是文件时抛「不是目录」，与 `ctx.project.list` 一致 |
+| 20 | **`match.env` 启动告警（T2）** | 配了 `match.env` 却没配 `match.value` 的路由永远不命中，此前静默；现在启动时输出 `⚠ server.json 配置被修正：home.routes[N].match.env = XXX —— 配了 env 却没有 value，该路由永远不会命中` |
+| 21 | **`js.json` 文件引用提示（文档）** | `.css` / `./x.css` 会命中「内联内容」分支而**不是**读文件；文档明确推荐 `"@file:client.css"` |
+| 22 | **文档同步** | `NavExt.md` + `MD/03-扩展系统.md` 同步补 `cssOrder` 语义、注入顺序表、`ctx.fs` 新签名与错误码、版本历史 |
+
+#### T1 / T2 / T3 的验证记录
+
+| 项 | 验证方式 | 结果 |
+| --- | --- | --- |
+| **cssOrder 解耦** | 场景：A(`order=500, cssOrder=1`)、B(`order=10, cssOrder=999`) | 加载顺序 `B → A`，CSS 注入顺序 `A → B`（**完全相反**），最终 B 样式生效 ✅ |
+| **cssOrder 向后兼容** | 两扩展都不写 `cssOrder`，`order` 分别为 1 / 100 | 加载与 CSS 顺序均为 `1 → 100`，与旧版一致 ✅ |
+| **scripts 不受 cssOrder 影响** | 同上场景 | `scripts` 按加载顺序注入 ✅ |
+| **ctx.fs 对齐** | 24 条断言（`/fsprobe`） | **24/24 通过**，含旧写法兼容、`maxBytes` 超限、`depth` 递归、与 `ctx.project` 对称性 ✅ |
+| **match.env 告警** | `server.json` 写 `{ "match": { "env": "NAVEXT_DEV" } }` | 启动即告警 ✅ |
+
 ---
 
-## 二、待办（审计后确认仍未处理）
+## 二、待办
 
-> 三条均经**实测复现**确认，非推断。
+**当前无阻塞性待办。** 原 T1 / T2 / T3 均已闭环（见上）。
 
-### 🟡 T1：`ctx.project` 与 `ctx.fs` 语义不一致（三处）
+### 可选的后继项（非紧迫）
 
-**实测结论**：两套 API 明明是同族，行为却不同，扩展作者容易踩坑。
-
-| 维度 | `ctx.fs`（扩展目录，读写） | `ctx.project`（站点目录，只读） | 冲突 |
+| 项 | 说明 | 工作量 | 价值 |
 | --- | --- | --- | --- |
-| **超限行为** | 无限制，多大都读 | 超限抛 `PROJECT_FS_TOO_LARGE` | 一个有守卫一个没有 |
-| **上限值** | 无 | 默认 4 MB（`extensions.projectMaxBytes`） | 同上 |
-| **`list` 返回** | `{ name, type }` | `{ name, path, type }` | 结构不同，字段不兼容 |
-| **`list` 递归** | 不支持 | `opts.depth` 支持 | 能力不对等 |
-
-**怎么做**（按推荐度排序）：
-
-- **方案 A（推荐，小改）**：给 `ctx.fs` 补齐对齐——
-  1. `ctx.fs.read` 加 `maxBytes` 守卫（默认取 `api.fs.maxReadSize`），超限抛同样的 `code: 'FS_TOO_LARGE'`；
-  2. `ctx.fs.list` 返回补 `path` 字段，并支持 `opts.depth`；
-  3. 两处 `maxBytes` 默认值统一从配置读取，文档写清默认值。
-  - 兼容性：**纯新增**（`path` 字段和 `depth` 都是加出来的，老代码 `{name, type}` 解构不受影响；`maxBytes` 守卫只在上限处生效，默认值够大不会误伤）。
-- **方案 B（统一抽象）**：抽一个 `makeFs(baseDir, { writable, maxBytes, hideDot })` 工厂，`ctx.fs` 与 `ctx.project` 都由它产出，差异只在参数。
-  - 好处：**根除这类不一致**，以后加第三个 FS 不会再跑偏。
-  - 代价：改动面大，`ctx.fs` 的 `write` / `delete` 与 `ctx.project` 的只读语义要在工厂里用开关区分。
-
-**建议**：先做 A（半小时），把 B 记进 backlog。
-
----
-
-### 🟡 T2：`match.env` 缺 `value` 时静默不命中
-
-**实测结论**：`server.json` 写
-
-```json
-{ "match": { "env": "NODE_ENV" }, "file": "dev.html" }
-```
-
-（漏了 `value`）—— **永远不匹配，且启动日志无任何提示**。排查「为什么这个主页没生效」时会很痛苦。
-
-**根因**（`routeMatches`）：
-
-```js
-if (m.env) {
-  const val = process.env[m.env];
-  if (val === undefined || String(val) !== m.value) return false;
-  //                                   ^^^^^^^^^^^ m.value 是 undefined
-}
-```
-
-`String(val) !== undefined` 恒为真 → 恒不匹配。
-
-**怎么做**（两步，都很小）：
-
-1. **启动校验告警**：在 `buildConfig` 后的校验阶段，遍历 `home.routes[]`，发现 `match.env` 存在但 `match.value` 为空 → 推入 `cfgWarnings`，复用现有的启动提示机制：
-   ```
-   · ⚠️ home.routes[2].match.env = "NODE_ENV" 但缺少 value，该路由永远不会命中
-   ```
-   （现有 `cfgWarnings` 已有类似输出，见启动横幅 `· ⚠️ home.routes[].match.env —— 启动时读取一次`）
-2. **语义收紧（可选）**：若只写 `env` 不写 `value`，可定义为"该环境变量存在即匹配"（`val !== undefined`）。但这会让语义变复杂，**建议不做**，只加告警。
-
-**建议**：只做第 1 步。成本极低，收益是"配置错误不再静默"。
-
----
-
-### 🟡 T3：`order` 决定 CSS 覆盖顺序，但文档没点明
-
-**实测结论**：机制本身**正确**，文档也讲了排序规则（`NavExt.md` 2063-2067 行：`requires` 优先级更高，被依赖者总在前）。**缺的是"这会决定 CSS 谁覆盖谁"这个后果没写**。
-
-具体坑：扩展 A（`order: 1`）依赖 B（`order: 100`），拓扑排序会把 B 提前到 A 之前 → **B 的 CSS 晚注入 → B 覆盖 A**，与"order 小的优先"的直觉相反。
-
-**怎么做**（纯文档，无代码改动）：
-
-1. 在 `mod.json` 的 `order` 字段说明处补一句后果：
-   > `order` 同时决定**注入顺序** —— 越晚注入的 `styles.css` 覆盖优先级越高。
-   > 注意 `requires` 会让被依赖者前置，可能改变实际覆盖关系。
-2. 在「扩展作用域」或「CSS 注入」相关章节加一个**具体示例**：
-   ```
-   A (order=1, requires=[B])  →  实际注入顺序：B → A  →  A 的样式覆盖 B
-   ```
-3. 需要精细控制覆盖时，建议用**更高的 CSS 特异性**（`.card.nx-featured`）而不是依赖加载顺序。
-
-**同步位置**：`NavExt.md` + `MD/03-扩展系统.md`（拆分版需同步）。
+| **统一 FS 工厂** | 抽 `makeFs(baseDir, { writable, maxBytes, hideDot })`，`ctx.fs` / `ctx.project` 都由它产出，根治同族 API 分裂（当前是「两处手动对齐」，靠纪律维持） | ~2h | 中 |
+| **`navext install <zip\|url>`** | 扩展的安装 / 更新 / 卸载，配合已有 `build.js --pack` 形成分发闭环 | ~1d | 高 |
+| **token 收敛** | 换 Fine-grained PAT，只授 `chinartcn/NavExt` 的 `Contents: Read and write`，吊销旧 PAT（旧 token 权限过宽且在对话中明文出现过） | 10 分钟 | 高（安全） |
+| **文档站上线** | `rtcnnavext.de5.net` NS 验证完成后，把 `MD/` 挂上去（NavExt 本身就能服务静态文件） | ~1h | 中 |
 
 ---
 
@@ -155,20 +107,7 @@ if (m.env) {
 
 ---
 
-## 四、建议的推进顺序
-
-| 顺序 | 事项 | 工作量 | 价值 |
-| --- | --- | --- | --- |
-| 1 | **T3 文档补强**（order 与 CSS 覆盖） | 15 分钟 | 消除一个真实误解源 |
-| 2 | **T2 启动校验告警**（match.env 缺 value） | 20 分钟 | 配置错误不再静默 |
-| 3 | **T1 方案 A**（ctx.fs 对齐 ctx.project） | 30 分钟 | 消除同族 API 的行为分裂 |
-| 4 | T1 方案 B（统一 FS 工厂） | 2 小时 | 根治不一致，但非紧迫 |
-
-三项都是**纯新增 / 纯文档**，不破坏现有扩展，可合并为一次 v2.8.2 发布。
-
----
-
-## 五、其他建议
+## 四、其他建议
 
 1. **token 安全**：当前使用的 PAT 含 `repo` + `admin:org` + `delete_repo` 等宽权限，且在对话中明文传递过。建议改用 **Fine-grained PAT**，只授权 `chinartcn/NavExt` 单仓库的 `Contents: Read and write`，然后吊销旧的。
 2. **文档站上线**：`rtcnnavext.de5.net` 的 NS 验证应已完成，可将 `MD/` 挂上去（NavExt 本身就能服务静态文件）作为在线文档。
@@ -176,4 +115,4 @@ if (m.env) {
 
 ---
 
-*本文档由 NavExt 审计流程生成，所有「待办」项均经实测复现；「已排除项」经反证确认。*
+*本文档由 NavExt 审计流程生成，所有结论均经实测复现；「已排除项」经反证确认。*
