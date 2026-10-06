@@ -3408,6 +3408,10 @@ function apiExtensionsList(app, cfg) {
       enabled: mod.enabled !== false,
       hasConfig: e.config.fields.length > 0,
       hasUserConfig: e.config.hasUserValues,
+      // v2.8.1：补上 scope，与 buildNavData（页面内 __NAV_DATA__）保持一致。
+      // 此前只有页面内 payload 有，外部脚本 / CI 无法从本端点得知扩展作用域，
+      // 排查「某扩展为什么没在这个页面生效」时看不到依据。
+      scope: e.scope || null,
     };
   });
 }
@@ -4058,6 +4062,8 @@ async function handleApi(app, req, res, url, pathname) {
       config: ext.config.values,
       configSchema: ext.config.fields,
       hasUserConfig: ext.config.hasUserValues,
+      // v2.8.1：补上 scope，与列表端点和页面内 __NAV_DATA__ 保持一致
+      scope: ext.scope || null,
     });
   }
 
@@ -4094,6 +4100,8 @@ function handleNavJson(app, res, url) {
       config: e.config.values,
       configSchema: e.config.fields,
       hasUserConfig: e.config.hasUserValues,
+      // v2.8.1：补上 scope，与 buildNavData（页面内 __NAV_DATA__）保持一致
+      scope: e.scope || null,
     })),
     dirs: [...dirMeta.entries()].map(([dir, info]) => ({
       dir, title: info.title || '', description: info.description || '',

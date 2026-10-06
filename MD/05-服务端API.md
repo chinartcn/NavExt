@@ -33,15 +33,30 @@ GET /api/extensions
       "order": 10,
       "enabled": true,
       "hasConfig": true,
-      "hasUserConfig": false
+      "hasUserConfig": false,
+      "scope": null
+    },
+    {
+      "id": "arch-diagram",
+      "name": "架构图",
+      "version": "1.0.0",
+      "order": 20,
+      "enabled": true,
+      "hasConfig": false,
+      "hasUserConfig": false,
+      "scope": { "paths": ["/docs/*"], "exclude": [] }
     }
   ]
 }
 ```
 
+> `scope` 字段为 `v2.8.1` 新增。在此之前只有页面内 `window.__NAV_DATA__` 带
+> `scope`，本端点和 `GET /?format=json` 都不返回——排查「某扩展为什么没在这个
+> 页面生效」时没有依据。现在三个出口口径一致。`null` 表示无限制（所有页面生效）。
+
 GET /api/extensions/:id
 
-返回单个扩展的详情，含 config 和 configSchema。
+返回单个扩展的详情，含 config、configSchema 和 scope。
 
 GET /api/extensions/:id/stats
 
