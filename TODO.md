@@ -1,15 +1,16 @@
 # NavExt 收尾清单 — 已完成 / 待办 / 怎么做
 
 > 更新时间：2026-10-06
-> 当前版本：**v2.8.2**
-> 范围：v2.7.0 → v2.8.2 的已落地事项
+> 当前版本：**v2.8.3**
+> 范围：v2.7.0 → v2.8.3 的已落地事项
 > 方法：逐条实测验证，不做"看起来对"的推断（见文末「已排除项」）
 >
 > **✅ 原第二节的三条待办（T1 / T2 / T3）已在 v2.8.2 全部处理完毕**，详见下方「v2.8.2」小节。
+> **✅ v2.8.3 把导航页降级为可选扩展（`.js/navext-ui/`），并新增 `install.js` 安装脚本。**
 
 ---
 
-## 一、已完成（v2.7.0 → v2.8.2）
+## 一、已完成（v2.7.0 → v2.8.3）
 
 ### v2.7.0 — 扩展生命周期 + 路径归一化
 
@@ -57,6 +58,25 @@
 | 20 | **`match.env` 启动告警（T2）** | 配了 `match.env` 却没配 `match.value` 的路由永远不命中，此前静默；现在启动时输出 `⚠ server.json 配置被修正：home.routes[N].match.env = XXX —— 配了 env 却没有 value，该路由永远不会命中` |
 | 21 | **`js.json` 文件引用提示（文档）** | `.css` / `./x.css` 会命中「内联内容」分支而**不是**读文件；文档明确推荐 `"@file:client.css"` |
 | 22 | **文档同步** | `NavExt.md` + `MD/03-扩展系统.md` 同步补 `cssOrder` 语义、注入顺序表、`ctx.fs` 新签名与错误码、版本历史 |
+
+### v2.8.3 — 导航页降级为可选扩展 + 安装脚本
+
+| # | 能力 | 内容 |
+| --- | --- | --- |
+| 23 | **新增 `onNavPage(ctx)` 钩子** | 内核渲染展示页时调用；扩展返回 `{ html }` 即作为 `<body>` 内容，返回 `null` 则让位下一个扩展。判定「有没有展示页」靠 `hasNavPageProvider()`（不硬编码扩展 id），按 scope / 页面策略过滤后探测 |
+| 24 | **新增 `ctx.nav` 只读快照** | `{ root, pathname, files, dirs, site, stats }`；`files[].path` 与 `?format=json` 输出命名一致。解决「扩展拿不到扫描结果」的根本问题 |
+| 25 | **展示页搬迁为扩展 `.js/navext-ui/`** | `index.js`（onNavPage 实现）+ `client.js`（搜索/快捷键）+ `styles.css`（展示页样式）+ `mod.json`（`order`/`cssOrder` = 10）+ `js.json`（`@file:` 引用）。内核删除 `renderCard`/`renderSection`/`groupFilesByDir`/`sortDirKeys`/`CORE_SEARCH_SCRIPT` 与 `BASE_STYLE` 的展示页样式，共约 260 行 |
+| 26 | **内核只保留主题变量** | 亮/暗两套基础色与 `--brand` / `--brand-ring` 留在 `BASE_STYLE()`。原因：其他扩展（面板、徽章）依赖这套变量配色，随展示页搬走会让它们集体失效 |
+| 27 | **三层回退（`renderNavFallback`）** | 无展示页扩展时：① 服务 `root/index.html`（照常注入扩展、过 `onHtml`）② 没有则 **HTTP 200 + 0 字节**。其他扩展在任何情况下都照常加载 |
+| 28 | **API 同步降级** | `GET /?format=json` 与 `GET /api/search` 在无展示页扩展时返回 404 + 明确原因（它们输出的正是展示页的数据源） |
+| 29 | **`build.js` 打包开关** | `--no-ui-ext` / `--with-ui-ext`（默认带）。排除时同步 `pruneUiExtFromList()` 从 `.js/js.list.json` 剔除条目（支持四种清单形态），并把源文件收进 `.js-install/navext-ui/` 作为安装载荷（内核不扫描该目录） |
+| 30 | **新增 `install.js`（零依赖）** | 先探测（目录 + 清单双向）再询问，默认「是」；支持 `--yes` / `--no` / `--dry-run` / `--force` / `--root`；非交互环境默认安装；自动识别并修复「目录与清单不一致」的半装状态；源文件依次在 `.js-install/` 与 `.js/` 两处查找 |
+| 31 | **`cli.js install` 子命令** | 透传到 `install.js`。修正 `parseArgs` 吞掉未知选项的问题：新增 `rawArgsAfter()`，从原始 argv 切片转发（`--dry-run` 等不再丢失） |
+| 32 | **启动横幅展示页状态** | 已装 → `展示页 navext-ui`；未装 → `展示页 ✖ 未安装（无扩展实现 onNavPage）` + 下一步行为（服务 index.html / 返回空页面）+ 安装命令 |
+| 33 | **`err.sh` 适配 v2.8.3** | 身份探针依赖 `/?format=json`（现由展示页扩展提供）。沙箱预装 `.js/navext-ui/`，`reset_js` 与 `set_list` 均保证目录与清单同时含 `navext-ui`，否则 identity 校验会全部误判为「端口被占」 |
+| 34 | **A/B 结构对比** | 用 v2.8.2 与 v2.8.3 在相同站点内容下渲染，提取 `<body>` 到 `nav-data` 之间的核心区做 difflib 对比 —— **101 行 vs 101 行，剔除环境差异后结构完全一致** |
+| 35 | **回归验证** | `err.sh` 20/20、`pathtest.js` 31/31、`lifetest.js` 22/22、`parity.js` 15 组×2 方向；`ctx.fs` / `ctx.project` 对称性复测通过（`FS_TOO_LARGE` / `PROJECT_FS_TOO_LARGE`、越界与 dotfile 均被拦截） |
+| 36 | **文档同步** | `NavExt.md`、`MD/03-扩展系统.md`（新增 `onNavPage` 专节 + `ctx.nav`）、`MD/06-主页与路由.md`（三层回退 + 安装/卸载）、`MD/07-打包与分发.md`（`--no-ui-ext` 开关 + `.js-install/`） |
 
 #### T1 / T2 / T3 的验证记录
 

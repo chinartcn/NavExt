@@ -65,6 +65,7 @@ const opts = {
   sfx: false,
   output: null,
   extensions: true,
+  uiExt: true,        // v2.8.3：是否打包内置展示页扩展（.js/navext-ui）
   list: false,
 };
 
@@ -73,6 +74,8 @@ for (let i = 2; i < process.argv.length; i++) {
   if (a === '--pack') opts.pack = true;
   else if (a === '--sfx') { opts.pack = true; opts.sfx = true; }
   else if (a === '--no-extensions') opts.extensions = false;
+  else if (a === '--no-ui-ext') opts.uiExt = false;
+  else if (a === '--with-ui-ext') opts.uiExt = true;
   else if (a === '--list') opts.list = true;
   else if (a === '-o' || a === '--output') opts.output = process.argv[++i];
   else if (a.startsWith('--output=')) opts.output = a.slice(9);
@@ -84,6 +87,8 @@ for (let i = 2; i < process.argv.length; i++) {
   --pack              打包成 tar.gz
   --sfx               打包成自解压 .sh（隐含 --pack）
   --no-extensions     打包时不带 .js/ 扩展
+  --no-ui-ext         不打包内置展示页扩展（.js/navext-ui）
+  --with-ui-ext       打包内置展示页扩展（默认）
   --list              打包前列出会包含的文件
   -o, --output <file> 输出文件路径
   -h, --help          显示帮助
@@ -93,6 +98,7 @@ for (let i = 2; i < process.argv.length; i++) {
   node build.js --pack               生成 app.tar.gz
   node build.js --pack --sfx         生成 app.sh
   node build.js --sfx -o run.sh      自解压输出到 run.sh
+  node build.js --pack --no-ui-ext   打包但不带内置展示页（根路径退化为 index.html）
 `);
     process.exit(0);
   }
@@ -182,6 +188,8 @@ const SKIP_FILES = new Set([
   'package-lock.json',    // 无依赖，不用
   '.DS_Store',
   'Thumbs.db',
+  // 注意：install.js 不在此列表 —— 它是「部署后按需安装展示页」的
+  // 入口脚本，必须随发布包一起分发（见 v2.8.3）。
 ]);
 
 /** 顶层排除的目录（精确名匹配） */
@@ -197,6 +205,28 @@ const SKIP_DIRS = new Set([
   '.vscode',
   'dist-test',
 ]);
+
+/**
+ * 内置展示页扩展的目录名（v2.8.3）。
+ *
+ * 它是唯一一个「内核不再内置、改为可选扩展」的构件：
+ * 不打包时，根路径 / 会退化为服务 index.html，找不到则返回 0 字节空页面。
+ * 用 --no-ui-ext 排除，用 install.js 在部署后按需安装。
+ */
+const UI_EXT_DIR_NAME = 'navext-ui';
+
+/**
+ * 「展示页安装载荷」目录名（v2.8.3）。
+ *
+ * 用 --no-ui-ext 打包时，.js/navext-ui/ 被排除在扩展加载之外，
+ * 但 install.js 仍需要一份源文件才能安装。于是把它放到这个临时目录里：
+ * 内核只扫描 .js/，不会把它当成已加载的扩展（不会出现在清单里），
+ * 但 install.js 能找到它并复制到 .js/navext-ui/。
+ */
+const UI_INSTALL_PAYLOAD_DIR = '.js-install';
+
+/** collectDir 时是否跳过了展示页扩展（用于打包后提示） */
+let skippedUiExt = false;
 
 /** 备份 / 临时文件模式 */
 const BACKUP_PATTERNS = [
@@ -319,6 +349,13 @@ function collectDir(absDir, prefix, out, depth, extRoot) {
       if (!isExtDir && !shouldIncludeDir(name, depth)) continue;
       if (isExtDir && !opts.extensions) continue;
 
+      // v2.8.3：扩展目录下的一级子目录就是各个扩展，--no-ui-ext 时跳过展示页扩展
+      const isExtChild = (depth === 1 && prefix === extRoot);
+      if (isExtChild && !opts.uiExt && name === UI_EXT_DIR_NAME) {
+        skippedUiExt = true;
+        continue;
+      }
+
       out.push({ name: rel + '/', data: Buffer.alloc(0), dir: true });
       collectDir(abs, rel, out, depth + 1, extRoot);
       continue;
@@ -382,9 +419,71 @@ function collectPackFiles(distSource) {
   });
 
   // 3) 递归收集项目内容（HTML / 资源 / 扩展 / 配置）
+  //    注意：此时源目录里的 .js/navext-ui/ 可能已被 --no-ui-ext 跳过，
+  //    但 install.js 需要单独补上一份「可安装的展示页源」才能工作。
   collectDir(ROOT, '', files, 0, extRoot);
 
+  // 3.5) 保留 install.js（发布包里必须存在，用于部署后补装展示页）
+  //      正常情况 collectDir 已收录；这里只是显式兜底，避免将来被误加进 SKIP_FILES。
+  if (!files.some((f) => f.name === 'install.js')) {
+    try {
+      files.push({ name: 'install.js', data: fs.readFileSync(path.join(ROOT, 'install.js')) });
+    } catch {}
+  }
+
+  // 3.6) --no-ui-ext 时，把展示页扩展的源文件收进 install 用的载荷目录
+  //      `.js-install/navext-ui/`。它不参与扩展加载（不在 .js/ 下），
+  //      仅供 install.js 在部署后复制到 .js/navext-ui/。
+  if (skippedUiExt) {
+    collectDir(
+      path.join(ROOT, extRoot, UI_EXT_DIR_NAME),
+      path.join(UI_INSTALL_PAYLOAD_DIR, UI_EXT_DIR_NAME),
+      files, 0, path.join(UI_INSTALL_PAYLOAD_DIR, UI_EXT_DIR_NAME)
+    );
+  }
+
+  // 4) --no-ui-ext：从 js.list.json 里剔除展示页扩展
+  //    否则部署后内核会警告「清单里的扩展不存在」。
+  if (skippedUiExt) pruneUiExtFromList(files, extRoot);
+
   return files;
+}
+
+/**
+ * 把展示页扩展从打包后的 .js/js.list.json 中移除（v2.8.3）。
+ *
+ * js.list.json 支持四种形态（数组 / {extensions:[]} / {list:[]} / {id:scope}），
+ * 这里只做最小侵入的改写：只动数组元素，不改变整体结构。
+ */
+function pruneUiExtFromList(files, extRoot) {
+  const listName = extRoot + '/js.list.json';
+  const f = files.find((x) => x.name === listName);
+  if (!f) return;
+
+  try {
+    const raw = JSON.parse(f.data.toString('utf8'));
+
+    const stripArr = (arr) => arr.filter((x) => {
+      if (typeof x === 'string') return x !== UI_EXT_DIR_NAME;
+      if (x && typeof x === 'object') return !(UI_EXT_DIR_NAME in x);
+      return true;
+    });
+
+    let next;
+    if (Array.isArray(raw)) next = stripArr(raw);
+    else if (raw && Array.isArray(raw.extensions)) next = Object.assign({}, raw, { extensions: stripArr(raw.extensions) });
+    else if (raw && Array.isArray(raw.list)) next = Object.assign({}, raw, { list: stripArr(raw.list) });
+    else next = null;
+
+    if (next === null) {
+      console.warn(`  ⚠ 无法识别 ${listName} 的结构，未剔除 ${UI_EXT_DIR_NAME}`);
+      return;
+    }
+
+    f.data = Buffer.from(JSON.stringify(next, null, 2), 'utf8');
+  } catch (err) {
+    console.warn(`  ⚠ 解析 ${listName} 失败（${err.message}），未剔除 ${UI_EXT_DIR_NAME}`);
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -631,6 +730,15 @@ if (stats.fonts)  console.log(`    字体        ${stats.fonts} 个`);
 if (stats.other)  console.log(`    其他        ${stats.other} 个`);
 if (stats.ext)    console.log(`    扩展文件    ${stats.ext} 个`);
 console.log('');
+
+// v2.8.3：内置展示页是可选项 —— 排除了就必须说清楚后果
+if (skippedUiExt) {
+  console.log(`  ⚠ 未包含内置展示页扩展（.js/${UI_EXT_DIR_NAME}）`);
+  console.log('     部署后根路径 / 会服务站点根目录的 index.html；');
+  console.log('     若没有 index.html，则返回 200 + 0 字节空页面（其他扩展照常工作）。');
+  console.log('     需要展示页时，在部署目录执行：node install.js');
+  console.log('');
+}
 
 if (opts.sfx) {
   console.log('  使用方式：');

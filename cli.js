@@ -1022,6 +1022,25 @@ function cmdBuild(args, opts) {
   runNode(buildPath, args, 'build');
 }
 
+/**
+ * install —— 安装内置展示页扩展（v2.8.3）。
+ *
+ * 透传到 install.js，原样转发其后的参数（--yes / --no / --dry-run / --force）。
+ * 该脚本只在「分发包解压后的部署目录」里有意义，因此优先用 opts.root。
+ */
+function cmdInstall(args, opts) {
+  const root = path.resolve(opts.root || process.cwd());
+  const installPath = path.join(root, 'install.js');
+
+  if (!fs.existsSync(installPath)) {
+    console.error(red('✖'), `找不到 install.js：${installPath}`);
+    console.log(gray('  install.js 随分发包提供，请确认 --root 指向解压后的部署目录'));
+    process.exit(1);
+  }
+
+  runNode(installPath, args, 'install');
+}
+
 function cmdPack(args, opts) {
   const root = findProjectRoot(opts);
   const buildPath = path.join(root, 'build.js');
@@ -1125,6 +1144,11 @@ function printHelp() {
     ${cyan('dev')}              直接运行源码（开发态）
     ${cyan('config')}           交互式编辑 server.json
 
+  ${bold('内置展示页')}
+    ${cyan('install')}          安装内置展示页扩展（.js/navext-ui）
+    ${cyan('install --no')}     跳过安装（根路径 / 退化为 index.html 或空页面）
+    ${cyan('install --dry-run')}  只探测安装状态，不做改动
+
   ${bold('通用选项')}
     -r, --root <dir>      指定根目录（扩展管理用）
     -y, --yes             使用默认值
@@ -1189,7 +1213,18 @@ function parseArgs(argv) {
   }
 
   opts.root = path.resolve(opts.root);
-  return { opts, rest };
+  return { opts, rest, argv: argv.slice() };
+}
+
+/**
+ * 取出「子命令之后的原始参数」（v2.8.3）。
+ *
+ * parseArgs 会吞掉它不认识的选项（如 --dry-run），所以需要透传的场景
+ * （install / build / pack）必须回到原始 argv 里切片，而不是用 rest。
+ */
+function rawArgsAfter(cmd, argv) {
+  const i = argv.indexOf(cmd);
+  return i === -1 ? [] : argv.slice(i + 1);
 }
 
 /* ============================================================ */
@@ -1197,7 +1232,7 @@ function parseArgs(argv) {
 /* ============================================================ */
 
 async function main() {
-  const { opts, rest } = parseArgs(process.argv.slice(2));
+  const { opts, rest, argv } = parseArgs(process.argv.slice(2));
 
   if (opts.version) {
     console.log(`navext v${NAVEXT_VERSION}`);
@@ -1210,6 +1245,8 @@ async function main() {
   }
 
   const [cmd, ...args] = rest;
+  /** 原始切片：子命令之后的完整参数，用于需要透传未知选项的场景 */
+  const tail = () => rawArgsAfter(cmd, argv);
 
   switch (cmd) {
     /* 扩展管理 */
@@ -1229,6 +1266,9 @@ async function main() {
     case 'dev':                              cmdDev(args, opts); break;
     case 'config': case 'cfg':               await cmdConfig(args, opts); break;
     case 'jsx':                              await cmdJsx(args, opts); break;
+
+    /* v2.8.3：内置展示页扩展 */
+    case 'install': case 'ui':                cmdInstall(tail(), opts); break;
 
     case 'help':                             printHelp(); break;
 

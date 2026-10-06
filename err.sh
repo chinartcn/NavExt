@@ -115,6 +115,16 @@ trap cleanup EXIT INT TERM
 cp "$SERVER_SRC" "$WORK_DIR/"
 cp "$PROJECT_DIR/.navext.client.js" "$WORK_DIR/" 2>/dev/null || true
 
+# v2.8.3：内置展示页已降级为可选扩展（.js/navext-ui）。
+# 本套件用 /?format=json 做「服务身份校验」——该端点由展示页扩展提供，
+# 没装就返回 404，identity 校验会全部误判为「端口被占」。
+# 因此沙箱里预装一份展示页扩展（仅身份探针用，与各测试的 reset_js 互不干扰）。
+UI_EXT_SRC="$PROJECT_DIR/.js/navext-ui"
+if [ -d "$UI_EXT_SRC" ]; then
+  mkdir -p "$WORK_DIR/.js/navext-ui"
+  cp "$UI_EXT_SRC"/* "$WORK_DIR/.js/navext-ui/" 2>/dev/null || true
+fi
+
 cat > "$WORK_DIR/server.json" << EOF
 {
   "port": $PORT,
@@ -164,8 +174,38 @@ stop_server() {
   SERVER_PID=""
 }
 
-reset_js() { rm -rf "$WORK_DIR/.js"; mkdir -p "$WORK_DIR/.js"; }
-set_list() { cat > "$WORK_DIR/.js/js.list.json"; }
+reset_js() {
+  # v2.8.3：展示页扩展（navext-ui）必须同时存在于目录与清单里，
+  # 否则 /?format=json 会 404，身份探针全部误判为「端口被占」。
+  rm -rf "$WORK_DIR/.js"
+  mkdir -p "$WORK_DIR/.js"
+  if [ -d "$UI_EXT_SRC" ]; then
+    mkdir -p "$WORK_DIR/.js/navext-ui"
+    cp "$UI_EXT_SRC"/* "$WORK_DIR/.js/navext-ui/" 2>/dev/null || true
+    printf '{\n  "extensions": ["navext-ui"]\n}\n' > "$WORK_DIR/.js/js.list.json"
+  fi
+}
+# 写清单（v2.8.3：自动并入 navext-ui，否则身份探针拿不到 ?format=json）
+# 两个来源都读：stdin（测试用例）与文件参数；无 stdin 时用空对象兜底。
+set_list() {
+  local raw
+  raw="$(cat)"
+  if [ -z "$raw" ]; then raw='{"extensions":[]}'; fi
+
+  printf '%s' "$raw" | node -e '
+    let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
+      let o; try { o = JSON.parse(s); } catch { process.stdout.write(s); return; }
+      const UI = "navext-ui";
+      const add = (a) => (a.includes(UI) ? a : [UI, ...a]);
+      if (Array.isArray(o)) o = add(o);
+      else if (o && Array.isArray(o.extensions)) o.extensions = add(o.extensions);
+      else if (o && Array.isArray(o.list)) o.list = add(o.list);
+      else if (o && typeof o === "object") o = Object.assign({ [UI]: null }, o);
+      else o = { extensions: [UI] };
+      process.stdout.write(JSON.stringify(o, null, 2));
+    });
+  ' > "$WORK_DIR/.js/js.list.json"
+}
 
 require_server() {
   stop_server
@@ -405,7 +445,7 @@ EOF
     fi
   }
 
-  apply() { cat > "$WORK_DIR/.js/js.list.json"; sleep 1.0; }
+  apply() { set_list; sleep 1.0; }
 
   echo '{ "extensions": ["scope-probe"] }' | apply
   if probe "无 scope（基线）"; then
